@@ -104,8 +104,11 @@ the page with your own HTTP client / Scrapy / Zyte and pass
 
 ## API
 
-- **`extract(html: str) -> FlightExtractor`** — shorthand constructor.
-- **`FlightExtractor(html: str, *, strict: bool = False)`**
+- **`extract(html) -> FlightExtractor`** — shorthand constructor. `html`
+  accepts a plain string, bytes, or a response-like object (Scrapy's
+  `Response`, `requests.Response`, etc.) — pass `response` straight from a
+  `parse()` method without writing `response.text` yourself.
+- **`FlightExtractor(html, *, strict: bool = False)`**
   - `.keys() -> list[str]` — every chunk id found on the page, in order.
   - `page["3f"]` / `.resolve_chunk("3f")` — the resolved JSON for one
     specific chunk id (`page[...]` raises `KeyError` if it doesn't exist;
@@ -117,8 +120,22 @@ the page with your own HTTP client / Scrapy / Zyte and pass
   - `.find_one(predicate, root=None) -> Any | None`
   - `.find_by_keys(required_keys, root=None) -> dict | None` — find the
     first dict containing all of `required_keys`.
+  - `.find_all_by_keys(required_keys, root=None) -> list` — like
+    `find_by_keys` but returns every match, for pages with repeated
+    cards/listings that share the same shape.
   - `.find_by_type(type_value, key="@type", root=None) -> list` — find
     every dict whose `key` field equals `type_value`.
+  - `.find_text(pattern, root=None) -> list` — regex-search every string
+    value on the page and return the distinct whole values that contain a
+    match (emails, prices, phone numbers, SKUs, ...) without needing to
+    know which object they live on.
+  - `.get("path.to.value", default=None) -> Any` — tolerant dotted-path
+    lookup into the resolved page (dict keys and/or list indices), once
+    you already know roughly where something lives on this site.
+  - `.stats() -> dict` — quick diagnostic snapshot (chunk count, ids,
+    value type counts, page size) for exploring a new site.
+  - `.to_json(path=None, indent=2) -> str | None` — dump the fully
+    resolved page to a file, or return it as a JSON string.
   - `.from_url(url, timeout=15.0, headers=None) -> FlightExtractor`
     (classmethod) — fetch and parse a URL using only the stdlib.
   - `strict=True` raises `FlightParseError` on a row that's neither valid
@@ -126,10 +143,10 @@ the page with your own HTTP client / Scrapy / Zyte and pass
     keeping it as a raw string (useful while developing a new scraper;
     leave off in production so a handful of odd rows never take down
     extraction of everything else on the page).
-- **`find_json_ld(html: str, type_: str | None = None) -> list`** — parse
-  any `<script type="application/ld+json">` blocks on the page,
-  optionally filtered by `@type`.
-- **CLI**: `nextflight <file-or-url> [--keys a,b | --type Product | --all]`
+- **`find_json_ld(html, type_=None) -> list`** — parse any
+  `<script type="application/ld+json">` blocks on the page, optionally
+  filtered by `@type`. Also accepts response-like objects.
+- **CLI**: `nextflight <file-or-url> [--keys a,b | --all-by-keys a,b | --type Product | --text PATTERN | --get path.to.value | --stats | --all] [--save out.json]`
 
 No runtime dependencies — stdlib only (`json`, `re`, `urllib`, `argparse`)
 — so it's safe to drop into any existing Scrapy/Zyte project without
@@ -139,7 +156,7 @@ touching the rest of your dependency tree.
 
 The old names still work but emit a `DeprecationWarning`:
 
-| Old (0.1.x)                          | New (0.2.x)                     |
+| Old (0.1.x)                          | New (0.2.x+)                     |
 |---------------------------------------|----------------------------------|
 | `from nextjs_flight_extractor import NextFlightExtractor` | `from nextflight import FlightExtractor` |
 | `extractor.find_first(...)`           | `page.find_one(...)`            |

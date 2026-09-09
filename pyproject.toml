@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nextflight"
-version = "0.2.1"
+version = "0.3.0"
 description = "Parse Next.js App Router 'Flight' (__next_f.push) payloads embedded in server-rendered HTML -- works on any Next.js 13+ site."
 readme = "README.md"
 requires-python = ">=3.9"

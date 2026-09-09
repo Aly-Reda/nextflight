@@ -47,11 +47,37 @@ from __future__ import annotations
 import json
 import re
 import urllib.request
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 
 class FlightParseError(Exception):
     """Raised only when ``strict=True`` and a row cannot be parsed at all."""
+
+
+def _coerce_html(source: Any) -> str:
+    """Accept a raw HTML string/bytes, or a response-like object (Scrapy's
+    ``Response``, ``requests.Response``, httpx, etc.) and return plain text.
+
+    This means both of these just work:
+
+        FlightExtractor(response)          # Scrapy / requests response
+        FlightExtractor(response.text)     # or the plain string, as before
+    """
+    if isinstance(source, str):
+        return source
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source).decode("utf-8", errors="replace")
+    text_attr = getattr(source, "text", None)
+    if isinstance(text_attr, str):
+        return text_attr
+    body_attr = getattr(source, "body", None)
+    if isinstance(body_attr, (bytes, bytearray)):
+        return bytes(body_attr).decode("utf-8", errors="replace")
+    raise TypeError(
+        "Expected an HTML string, bytes, or a response-like object with a "
+        ".text or .body attribute (e.g. a Scrapy or requests Response); "
+        f"got {type(source).__name__}"
+    )
 
 
 class FlightExtractor:
@@ -60,7 +86,9 @@ class FlightExtractor:
     Parameters
     ----------
     html:
-        The full HTML of a server-rendered Next.js App Router page.
+        The full HTML of a server-rendered Next.js App Router page. Also
+        accepts bytes, or a response-like object with a `.text`/`.body`
+        attribute (Scrapy's `Response`, `requests.Response`, etc.).
     strict:
         If True, raise :class:`FlightParseError` when a row's value isn't
         valid JSON and doesn't look like a bare `$`-reference marker.
@@ -72,8 +100,8 @@ class FlightExtractor:
     _PUSH_CALL_RE = re.compile(r"self\.__next_f\.push\(")
     _ROW_START_RE = re.compile(r"[0-9a-zA-Z_\-]*:")
 
-    def __init__(self, html: str, *, strict: bool = False):
-        self.html = html
+    def __init__(self, html: Any, *, strict: bool = False):
+        self.html = _coerce_html(html)
         self.strict = strict
         self.raw_chunks: dict[str, Any] = {}
         self._resolved_cache: dict[str, Any] = {}
@@ -385,13 +413,22 @@ class FlightExtractor:
         r = self.find_all(predicate, root=root, max_results=1)
         return r[0] if r else None
 
-    def find_by_keys(self, required_keys, root: Any = None) -> Any:
+    def find_by_keys(self, required_keys: Iterable[str], root: Any = None) -> Any:
         """Find the first dict containing ALL of `required_keys` -- the
         pattern you almost always want: 'give me whatever object looks
         like the data I need', regardless of where this build's component
         tree happened to put it."""
         required_keys = set(required_keys)
         return self.find_one(
+            lambda n: isinstance(n, dict) and required_keys <= n.keys(), root=root
+        )
+
+    def find_all_by_keys(self, required_keys: Iterable[str], root: Any = None) -> list:
+        """Like :meth:`find_by_keys` but returns every matching dict, not
+        just the first -- useful for pages with repeated cards/listings
+        that all share the same shape (product cards, search results, ...)."""
+        required_keys = set(required_keys)
+        return self.find_all(
             lambda n: isinstance(n, dict) and required_keys <= n.keys(), root=root
         )
 
@@ -403,13 +440,93 @@ class FlightExtractor:
             lambda n: isinstance(n, dict) and n.get(key) == type_value, root=root
         )
 
+    def find_text(self, pattern, root: Any = None) -> list:
+        """Regex-search every string value in the resolved tree and return
+        the distinct whole string values that contain a match (this is a
+        substring search, like `re.search`, not an exact-match filter), in
+        the order first seen. Handy for pulling emails, phone numbers,
+        prices, or SKUs out of a page without having to know which object
+        they live on.
 
-def find_json_ld(html: str, type_: Optional[str] = None) -> list:
+            page.find_text(r"^\\$[\\d,]+(\\.\\d{2})?$")   # dollar amounts
+            page.find_text(re.compile(r"[\\w.+-]+@[\\w-]+\\.\\w+"))  # emails
+        """
+        compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+        data = self.resolve_all() if root is None else root
+        matches: list = []
+        seen: set = set()
+
+        def walk(node: Any):
+            if isinstance(node, str):
+                if node not in seen and compiled.search(node):
+                    seen.add(node)
+                    matches.append(node)
+            elif isinstance(node, dict):
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(data)
+        return matches
+
+    def get(self, path: str, default: Any = None, sep: str = ".") -> Any:
+        """Navigate the fully resolved page with a dotted path of dict keys
+        and/or list indices, e.g. ``page.get("3f.props.product.price")`` or
+        ``page.get("items.0.name")``. Returns `default` if any segment is
+        missing, instead of raising -- meant for quick, tolerant lookups
+        once you already know roughly where something lives on this site."""
+        current: Any = self.resolve_all()
+        for part in path.split(sep):
+            if isinstance(current, dict):
+                if part not in current:
+                    return default
+                current = current[part]
+            elif isinstance(current, list):
+                try:
+                    current = current[int(part)]
+                except (ValueError, IndexError):
+                    return default
+            else:
+                return default
+        return current
+
+    def stats(self) -> dict:
+        """A quick diagnostic snapshot -- handy the first time you point
+        this at a new site and want a feel for what's on the page before
+        writing search predicates."""
+        row_types: dict[str, int] = {}
+        for value in self.raw_chunks.values():
+            kind = type(value).__name__
+            row_types[kind] = row_types.get(kind, 0) + 1
+        return {
+            "chunk_count": len(self.raw_chunks),
+            "chunk_ids": self.keys(),
+            "value_type_counts": row_types,
+            "html_size_bytes": len(self.html.encode("utf-8")),
+        }
+
+    def to_json(self, path: Optional[str] = None, *, indent: int = 2) -> Optional[str]:
+        """Dump the fully resolved page as JSON. Writes to `path` if given
+        (returns None), otherwise returns the JSON string."""
+        text = json.dumps(self.resolve_all(), indent=indent, ensure_ascii=False, default=str)
+        if path is None:
+            return text
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return None
+
+
+def find_json_ld(html: Any, type_: Optional[str] = None) -> list:
     """Parse any <script type="application/ld+json"> blocks on the page,
     independent of Flight data and often more stable across redesigns --
     worth trying first for structured product/article/breadcrumb data.
 
-    `type_` optionally filters results by their "@type" (e.g. "Product")."""
+    `html` accepts a raw string/bytes, or a response-like object (Scrapy's
+    `Response`, `requests.Response`, etc.). `type_` optionally filters
+    results by their "@type" (e.g. "Product")."""
+    html = _coerce_html(html)
     blocks = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.DOTALL,
@@ -431,6 +548,9 @@ def find_json_ld(html: str, type_: Optional[str] = None) -> list:
     return out
 
 
-def extract(html: str, *, strict: bool = False) -> FlightExtractor:
-    """Shorthand for ``FlightExtractor(html)``."""
+def extract(html: Any, *, strict: bool = False) -> FlightExtractor:
+    """Shorthand for ``FlightExtractor(html)``. `html` accepts a raw
+    string/bytes, or a response-like object (Scrapy's `Response`,
+    `requests.Response`, etc.) -- you can pass `response` straight from a
+    Scrapy `parse()` method without writing `response.text` yourself."""
     return FlightExtractor(html, strict=strict)
