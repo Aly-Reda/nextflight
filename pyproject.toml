@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nextflight"
+version = "0.2.1"
+description = "Parse Next.js App Router 'Flight' (__next_f.push) payloads embedded in server-rendered HTML -- works on any Next.js 13+ site."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name" }
+]
+keywords = ["nextjs", "scraping", "scrapy", "flight", "rsc", "react-server-components", "web-scraping", "zyte"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# Stdlib only -- no runtime dependencies, so it's safe to drop into any
+# Scrapy / Zyte project without touching the rest of your dependency tree.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/yourname/nextflight"
+Issues = "https://github.com/yourname/nextflight/issues"
+
+[project.scripts]
+nextflight = "nextflight.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
