@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-    { name = "Your Name" }
+    { name = "Aly Reda" }
 ]
 keywords = ["nextjs", "scraping", "scrapy", "flight", "rsc", "react-server-components", "web-scraping", "zyte"]
 classifiers = [
@@ -29,8 +29,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/yourname/nextflight"
-Issues = "https://github.com/yourname/nextflight/issues"
+Homepage = "https://github.com/Aly-Reda/nextflight"
+Issues = "https://github.com/Aly-Reda/nextflight/issues"
 
 [project.scripts]
 nextflight = "nextflight.cli:main"
