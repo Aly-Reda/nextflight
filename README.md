@@ -319,6 +319,24 @@ parsing. `nextflight` implements the actual row grammar rather than
 splitting on `\n`, so it holds up on both well-formed pages and payloads
 truncated mid-chunk (e.g. by a proxy that cuts a response short).
 
+It also doesn't assume one `<script>self.__next_f.push(...)</script>`
+call is one complete, self-contained set of rows. On large real-world
+pages, Next.js's own streaming buffer can flush mid-string, splitting a
+single row's raw text across two or more separate `push()` calls with no
+separator between the pieces — all `push()` payloads are reassembled into
+one continuous stream before being split into rows, so this doesn't
+silently corrupt chunk ids on pages large enough to trigger it (confirmed
+against production pages where over half of all `push()` calls turned out
+to be mid-row continuations).
+
+Chunk ids aren't guaranteed unique, either — Next.js deliberately emits
+preload (`HL`) rows with a completely empty id (`:HL["/path.css","style"]`)
+since nothing ever needs to `$`-ref them individually, and real pages have
+had dozens of these sharing the same empty id. Rather than the later ones
+silently overwriting the earlier ones, only the first occurrence of a
+duplicated id keeps its real id; later ones get a synthesized, clearly
+distinguishable key (`"id#2"`, `"id#3"`, ...) so nothing gets lost.
+
 Parsing and resolution are both designed to scale roughly linearly with
 page size: rows are split cheaply up front, each chunk's JSON is decoded
 lazily on first access rather than all at once, and searches

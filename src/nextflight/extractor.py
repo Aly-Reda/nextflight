@@ -676,17 +676,56 @@ class FlightExtractor:
         return text[start:]
 
     def _extract_all(self) -> None:
-        for payload in self._iter_push_payloads():
-            for chunk_id, row_type, raw_value in self._split_rows(payload):
-                self._row_types[chunk_id] = row_type
-                self._raw_row_text[chunk_id] = raw_value
-                if self.strict:
-                    # strict=True means "tell me immediately if anything
-                    # on this page is malformed" -- materialize (and so
-                    # validate) every row right away rather than waiting
-                    # for something to access it, so a chunk nobody ever
-                    # looks at can still fail construction as before.
-                    self._materialize_chunk(chunk_id)
+        # Next.js's Flight stream doesn't guarantee one row (or even one
+        # complete row) per self.__next_f.push() call: for a page with
+        # enough data, the browser-side buffer for a given stream gets
+        # flushed mid-string, so a single logical row's raw text can be
+        # split across two (or more) separate push() calls with NO
+        # separator between the pieces -- concatenating them is required
+        # to reconstruct the real, continuous row stream before it can be
+        # split into rows at all. Treating each push() call as an
+        # independently complete set of rows (the previous approach) works
+        # by coincidence on smaller pages where every row happens to fit
+        # in one push() call, but silently produces garbage chunk ids
+        # (fragments of URLs, etc.) on larger real-world pages where it
+        # doesn't -- confirmed against production Next.js pages where over
+        # half of all push() calls were mid-row continuations.
+        combined = "".join(self._iter_push_payloads())
+        dup_counts: dict[str, int] = {}
+        for chunk_id, row_type, raw_value in self._split_rows(combined):
+            key = chunk_id
+            if key in self._row_types:
+                # Duplicate chunk id. Confirmed on real pages: Next.js
+                # deliberately emits many `HL` (preload) rows with a
+                # completely empty id (":HL[\"/path.css\",\"style\"]") since
+                # nothing ever needs to `$`-ref them individually -- on one
+                # real page, 43 separate preload rows all shared the empty
+                # id. Silently overwriting would keep only the last one and
+                # under-report the true row count. The FIRST occurrence
+                # keeps its original id untouched (so `$`-ref resolution
+                # into it is unaffected); every later occurrence gets a
+                # synthesized, clearly-marked unique key instead -- it was
+                # never uniquely `$`-ref-addressable anyway once its id
+                # collided, so nothing that used to work stops working.
+                n = dup_counts.get(chunk_id, 1) + 1
+                # A real chunk id can only contain [0-9a-zA-Z_-] (see
+                # _ROW_START_RE), so it can never itself contain "#" --
+                # a synthesized key can't collide with a genuine one. This
+                # loop is defensive housekeeping in case that ever changes,
+                # not a case that can currently be hit.
+                while f"{chunk_id}#{n}" in self._row_types:
+                    n += 1
+                dup_counts[chunk_id] = n
+                key = f"{chunk_id}#{n}"
+            self._row_types[key] = row_type
+            self._raw_row_text[key] = raw_value
+            if self.strict:
+                # strict=True means "tell me immediately if anything
+                # on this page is malformed" -- materialize (and so
+                # validate) every row right away rather than waiting
+                # for something to access it, so a chunk nobody ever
+                # looks at can still fail construction as before.
+                self._materialize_chunk(key)
 
     def _materialize_chunk(self, chunk_id: str) -> Any:
         """JSON-decode a single chunk's raw row text (see

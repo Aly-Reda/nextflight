@@ -1395,3 +1395,137 @@ def test_from_rsc_url_auto_discover_false_skips_extra_fetch():
         assert plain_fetch_count["n"] == 0
     finally:
         server.shutdown()
+
+
+# ------------------------------------------------------------------ #
+# Multi-push row continuation: on real, sufficiently large production
+# Next.js pages, a single logical row's raw text can be split across two
+# (or more) separate self.__next_f.push() calls with NO separator between
+# the pieces -- the browser-side stream buffer gets flushed mid-string.
+# Treating each push() call as an independently complete set of rows
+# (the previous approach) works by coincidence on small pages but produces
+# garbage chunk ids (fragments of whatever was mid-string, e.g. a URL) on
+# real pages where a row happens to straddle a push() boundary. Found via
+# strict=True validation against real production HTML, where a chunk id
+# of "https" turned out to be the tail of a URL that had been split
+# across two push() calls.
+# ------------------------------------------------------------------ #
+def test_row_split_across_two_push_calls_is_reassembled():
+    # Simulates the real-world case: a module row's URL array is split
+    # mid-string across two separate push() calls with no separator.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"3:I[897367,[\\"https://cdn.example.com/chunks/a"'
+        '])</script>'
+        '<script>self.__next_f.push([1, '
+        '".js\\",\\"https://cdn.example.com/chunks/b.js\\"],\\"Boundary\\"]"'
+        '])</script>'
+    )
+    page = extract(html)
+    # A naive per-payload parser would produce a bogus chunk id from the
+    # tail of the split URL (e.g. "js") instead of correctly reassembling
+    # chunk "3" as one continuous module row.
+    assert set(page.keys()) == {"3"}
+    resolved = page.resolve_chunk("3")
+    assert resolved == [
+        897367,
+        ["https://cdn.example.com/chunks/a.js", "https://cdn.example.com/chunks/b.js"],
+        "Boundary",
+    ]
+
+
+def test_row_split_across_three_push_calls_is_reassembled():
+    html = (
+        '<script>self.__next_f.push([1, "0:{\\"a\\":\\"pa"])</script>'
+        '<script>self.__next_f.push([1, "rt-tw"])</script>'
+        '<script>self.__next_f.push([1, "o\\"}"])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_chunk("0") == {"a": "part-two"}
+
+
+def test_normal_multi_push_pages_are_unaffected_by_reassembly():
+    # The common case -- each push() call contains one or more COMPLETE
+    # rows, nothing split -- must still work exactly as before.
+    html = (
+        '<script>self.__next_f.push([1, "0:{\\"a\\":1}"])</script>'
+        '<script>self.__next_f.push([1, "1:{\\"b\\":2}\\n2:{\\"c\\":3}"])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_all() == {"0": {"a": 1}, "1": {"b": 2}, "2": {"c": 3}}
+
+
+# ------------------------------------------------------------------ #
+# Duplicate chunk ids: Next.js deliberately emits many "HL" (preload)
+# rows with a completely empty id (":HL[\"/path.css\",\"style\"]"), since
+# nothing ever needs to $-ref them individually -- confirmed on a real
+# page with 43 such rows all sharing the empty id. Silently overwriting
+# by dict-key collision would keep only the last one. Duplicates get a
+# synthesized, clearly-marked unique key ("id#2", "id#3", ...) instead;
+# the first occurrence keeps its original id untouched.
+# ------------------------------------------------------------------ #
+def test_duplicate_empty_id_preload_rows_all_preserved():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '":HL[\\"/a.css\\",\\"style\\"]\\n'
+        ':HL[\\"/b.css\\",\\"style\\"]\\n'
+        ':HL[\\"/c.css\\",\\"style\\"]\\n'
+        '0:{\\"real\\":1}"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert len(page) == 4
+    assert set(page.keys()) == {"", "#2", "#3", "0"}
+    assert page.raw_chunks[""] == ["/a.css", "style"]
+    assert page.raw_chunks["#2"] == ["/b.css", "style"]
+    assert page.raw_chunks["#3"] == ["/c.css", "style"]
+    assert page.resolve_chunk("0") == {"real": 1}
+
+
+def test_duplicate_non_empty_id_also_gets_synthesized_key():
+    # The same handling applies to any duplicate id, not just the empty
+    # one -- the first occurrence is untouched (and stays $-ref-resolvable
+    # under its real id); later ones get "id#2", "id#3", etc.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"5:{\\"first\\":true}\\n'
+        '5:{\\"second\\":true}\\n'
+        '5:{\\"third\\":true}\\n'
+        '9:\\"$5\\""'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_chunk("5") == {"first": True}
+    assert page.resolve_chunk("5#2") == {"second": True}
+    assert page.resolve_chunk("5#3") == {"third": True}
+    # A $-ref to the (duplicated) id resolves to the FIRST occurrence,
+    # matching what raw_chunks["5"] itself resolves to.
+    assert page.resolve_chunk("9") == {"first": True}
+
+
+def test_duplicate_key_synthesis_handles_many_repeats_of_same_id():
+    # A chunk id can only ever contain [0-9a-zA-Z_-] (see _ROW_START_RE),
+    # so a real id can never itself contain "#" -- synthesized keys can
+    # never collide with a genuine one. This checks the simpler but still
+    # important guarantee: many repeats of the same id all get distinct,
+    # correctly incrementing synthesized keys, not just the first repeat.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"5:{\\"n\\":1}\\n5:{\\"n\\":2}\\n5:{\\"n\\":3}\\n5:{\\"n\\":4}\\n5:{\\"n\\":5}"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_chunk("5") == {"n": 1}
+    assert page.resolve_chunk("5#2") == {"n": 2}
+    assert page.resolve_chunk("5#3") == {"n": 3}
+    assert page.resolve_chunk("5#4") == {"n": 4}
+    assert page.resolve_chunk("5#5") == {"n": 5}
+    assert len(page) == 5
+
+
+def test_no_duplicates_means_keys_are_unaffected():
+    # Sanity: the common case (no duplicate ids at all) must produce
+    # exactly the same keys as always, with no "#" suffixes appearing.
+    html = '<script>self.__next_f.push([1, "0:{\\"a\\":1}\\n1:{\\"b\\":2}"])</script>'
+    page = extract(html)
+    assert set(page.keys()) == {"0", "1"}
