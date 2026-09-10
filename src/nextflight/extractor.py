@@ -46,7 +46,9 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Iterator, Optional
 
 # Optional accelerator: if the caller already has orjson installed (common
@@ -75,6 +77,46 @@ class FlightParseError(Exception):
     """Raised only when ``strict=True`` and a row cannot be parsed at all."""
 
 
+class _LazyRawChunks(Mapping):
+    """Dict-like view over a page's chunks that decodes each chunk's raw
+    JSON lazily, on first access, rather than all up front at parse time.
+
+    Splitting a payload into rows (finding where each chunk starts and
+    ends) is cheap and always needs to happen -- it's how chunk ids get
+    discovered at all. But actually JSON-decoding each row's *value* isn't
+    free, and a page can have dozens of chunks a caller never touches
+    (e.g. wanting just `price`/`title` off one listing among forty). This
+    defers that decode to whichever chunk is actually looked at, via
+    `FlightExtractor._materialize_chunk`, and caches the result so
+    repeated access doesn't re-decode.
+
+    Supports the same read interface as a plain dict (`in`, `len`,
+    iteration, `[key]`, `.keys()`/`.values()`/`.items()`/`.get()` via the
+    `Mapping` ABC) so existing code that treats `raw_chunks` as a dict
+    keeps working unchanged; only assignment isn't supported, since
+    materialization is meant to happen internally.
+    """
+
+    __slots__ = ("_extractor",)
+
+    def __init__(self, extractor: "FlightExtractor"):
+        self._extractor = extractor
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._extractor._row_types:
+            raise KeyError(key)
+        return self._extractor._materialize_chunk(key)
+
+    def __iter__(self):
+        return iter(self._extractor._row_types)
+
+    def __len__(self) -> int:
+        return len(self._extractor._row_types)
+
+    def __repr__(self) -> str:
+        return f"<LazyRawChunks {len(self)} chunk(s)>"
+
+
 def _coerce_html(source: Any) -> str:
     """Accept a raw HTML string/bytes, or a response-like object (Scrapy's
     ``Response``, ``requests.Response``, httpx, etc.) and return plain text.
@@ -99,6 +141,44 @@ def _coerce_html(source: Any) -> str:
         ".text or .body attribute (e.g. a Scrapy or requests Response); "
         f"got {type(source).__name__}"
     )
+
+
+def _read_urllib_response_text(resp) -> str:
+    """Read and decode an ``http.client.HTTPResponse`` from ``urlopen``,
+    handling `Content-Encoding` (gzip/deflate/br) transparently.
+
+    ``urllib`` doesn't advertise gzip support by default, so most servers
+    respond uncompressed -- but some (CDNs in particular) compress
+    unconditionally regardless of what the client asked for. `from_url` /
+    `from_rsc_url` also send ``Accept-Encoding: identity`` to ask for
+    plain text up front, but this decodes whatever actually comes back
+    either way, so a server that ignores that header doesn't leave the
+    caller holding raw compressed bytes."""
+    raw = resp.read()
+    encoding = (resp.headers.get("Content-Encoding") or "").lower()
+    if encoding == "gzip":
+        import gzip
+        raw = gzip.decompress(raw)
+    elif encoding == "deflate":
+        import zlib
+        raw = zlib.decompress(raw)
+    elif encoding == "br":
+        try:
+            import brotli  # type: ignore
+        except ImportError:
+            try:
+                import brotlicffi as brotli  # type: ignore
+            except ImportError:
+                raise RuntimeError(
+                    "Response is brotli-encoded but neither `brotli` nor "
+                    "`brotlicffi` is installed. Install one "
+                    "(`pip install brotli`), or pass "
+                    "headers={'Accept-Encoding': 'identity'} explicitly if "
+                    "the server still ignores the default identity request."
+                )
+        raw = brotli.decompress(raw)
+    charset = resp.headers.get_content_charset() or "utf-8"
+    return raw.decode(charset, errors="replace")
 
 
 class FlightExtractor:
@@ -127,10 +207,18 @@ class FlightExtractor:
     def __init__(self, html: Any, *, strict: bool = False):
         self.html = _coerce_html(html)
         self.strict = strict
-        self.raw_chunks: dict[str, Any] = {}
+        # Lazily-decoded view over each chunk's raw JSON -- see
+        # _LazyRawChunks and _materialize_chunk. The raw row text and row
+        # kind are what actually get populated during parsing (cheap);
+        # the JSON decode itself happens on first access per chunk.
+        self.raw_chunks: Mapping[str, Any] = _LazyRawChunks(self)
         # Which Flight row kind each chunk id came from ("text", "json",
         # "module", or "preload") -- powers .kind()/.json_keys()/.html_keys().
         self._row_types: dict[str, str] = {}
+        # The chunk's raw, still-undecoded row text, keyed by chunk id.
+        self._raw_row_text: dict[str, str] = {}
+        # Cache of already-materialized (JSON-decoded) chunk values.
+        self._materialized: dict[str, Any] = {}
         self._resolved_cache: dict[str, Any] = {}
         self._resolving: set[str] = set()
         # Guards re-entrant resolution of a *specific path* into a chunk
@@ -216,11 +304,13 @@ class FlightExtractor:
         """
         req = urllib.request.Request(
             url,
-            headers=headers or {"User-Agent": "Mozilla/5.0 (nextflight)"},
+            headers=headers or {
+                "User-Agent": "Mozilla/5.0 (nextflight)",
+                "Accept-Encoding": "identity",
+            },
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            html = resp.read().decode(charset, errors="replace")
+            html = _read_urllib_response_text(resp)
         return cls(html, strict=strict)
 
     @classmethod
@@ -251,9 +341,12 @@ class FlightExtractor:
             html = resp.text
         return cls(html, strict=strict)
 
+    _RSC_PARAM_RE = re.compile(r"[?&]_rsc=([A-Za-z0-9_-]+)")
+
     @classmethod
     def from_rsc_url(cls, url: str, *, timeout: float = 15.0, headers: Optional[dict] = None,
-                      cookies: Optional[dict] = None, strict: bool = False) -> "FlightExtractor":
+                      cookies: Optional[dict] = None, strict: bool = False,
+                      auto_discover: bool = True) -> "FlightExtractor":
         """Fetch a Next.js App Router page's raw RSC payload directly --
         a lighter-weight alternative to :meth:`from_url` that skips
         downloading the full HTML page, the same way Next.js's own
@@ -261,21 +354,44 @@ class FlightExtractor:
 
         Uses only the stdlib (no ``requests`` dependency). Pass
         `headers`/`cookies` to add request headers/cookies your target
-        site needs (session cookies, ``next-url``, etc. -- copy them from
-        a real browser request if the bare ``RSC: 1`` header alone gets
-        rejected or redirected to the full HTML page instead).
+        site needs (session cookies, etc. -- copy them from a real browser
+        request if the bare ``RSC: 1`` header alone gets rejected or
+        redirected to the full HTML page instead).
 
-        Some deployments also expect a build-specific ``_rsc=<id>`` query
-        parameter or a matching ``next-router-state-tree`` header; those
-        are page- and build-specific, so they aren't set automatically --
-        add them via `headers` / a `?_rsc=...` suffix on `url` if the bare
-        request doesn't return a raw payload (`len(page)` will be 0 if so;
-        check with :func:`detect_next_router` or :meth:`stats`).
+        Two of the fiddlier headers/params are handled automatically:
+
+        - ``Next-Url`` is set to `url`'s own path, since that's always
+          derivable and some deployments check it.
+        - If `url` doesn't already have a ``_rsc=<id>`` query parameter
+          and `auto_discover` is true (the default), this does one
+          ordinary GET of `url` first and looks for a ``_rsc=`` value in
+          any prefetch links Next.js embedded in the page (it reuses the
+          *same* build-specific id for every page in that deployment, so
+          this is genuinely the right value, not a guess) -- not every
+          page embeds one, so this is best-effort and silently does
+          nothing if none is found. Pass `auto_discover=False` to skip
+          this extra request (e.g. if you already know none exists, or
+          are supplying your own `_rsc` value in `url`/`headers`).
+
+        A matching ``Next-Router-State-Tree`` header is *not* reconstructed
+        automatically -- it's a serialized representation of the specific
+        route being navigated to/from, and some deployments require it to
+        match exactly while others don't need it at all. If the bare
+        request comes back with 0 chunks (check with :meth:`stats` or
+        `len(page)`), inspect a real browser's network tab for that header
+        and pass it via `headers`.
         """
+        if auto_discover and "_rsc=" not in url:
+            discovered = cls._discover_rsc_id(url, timeout=timeout)
+            if discovered:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}_rsc={discovered}"
         req_headers = {
             "User-Agent": "Mozilla/5.0 (nextflight)",
             "RSC": "1",
             "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Next-Url": urllib.parse.urlparse(url).path or "/",
         }
         if headers:
             req_headers.update(headers)
@@ -283,9 +399,26 @@ class FlightExtractor:
             req_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
         req = urllib.request.Request(url, headers=req_headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            text = resp.read().decode(charset, errors="replace")
+            text = _read_urllib_response_text(resp)
         return cls(text, strict=strict)
+
+    @classmethod
+    def _discover_rsc_id(cls, url: str, *, timeout: float) -> Optional[str]:
+        """Best-effort: fetch `url` normally (no RSC header) and look for
+        a `_rsc=<id>` value already embedded in the page (e.g. in a
+        Next.js prefetch `<link>`). Returns None on any failure or if
+        nothing is found -- this is an optimization, not something the
+        caller should depend on succeeding."""
+        try:
+            plain_req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0 (nextflight)", "Accept-Encoding": "identity"}
+            )
+            with urllib.request.urlopen(plain_req, timeout=timeout) as resp:
+                html = _read_urllib_response_text(resp)
+        except Exception:
+            return None
+        m = cls._RSC_PARAM_RE.search(html)
+        return m.group(1) if m else None
 
     # ------------------------------------------------------------------ #
     # Step 1 -- find every push([...]) call, bracket/quote aware, so it
@@ -546,29 +679,50 @@ class FlightExtractor:
         for payload in self._iter_push_payloads():
             for chunk_id, row_type, raw_value in self._split_rows(payload):
                 self._row_types[chunk_id] = row_type
-                if row_type == "text":
-                    self.raw_chunks[chunk_id] = raw_value
-                elif row_type in ("module", "preload"):
-                    try:
-                        self.raw_chunks[chunk_id] = _json_loads(raw_value)
-                    except _JSON_ERRORS:
-                        if self.strict:
-                            raise FlightParseError(
-                                f"chunk {chunk_id!r}: invalid {row_type} JSON: {raw_value[:80]!r}"
-                            )
-                        self.raw_chunks[chunk_id] = raw_value
-                else:
-                    if raw_value == "$undefined":
-                        self.raw_chunks[chunk_id] = None
-                        continue
-                    try:
-                        self.raw_chunks[chunk_id] = _json_loads(raw_value)
-                    except _JSON_ERRORS:
-                        if self.strict and not raw_value.startswith("$"):
-                            raise FlightParseError(
-                                f"chunk {chunk_id!r}: invalid JSON: {raw_value[:80]!r}"
-                            )
-                        self.raw_chunks[chunk_id] = raw_value  # bare marker e.g. "X"
+                self._raw_row_text[chunk_id] = raw_value
+                if self.strict:
+                    # strict=True means "tell me immediately if anything
+                    # on this page is malformed" -- materialize (and so
+                    # validate) every row right away rather than waiting
+                    # for something to access it, so a chunk nobody ever
+                    # looks at can still fail construction as before.
+                    self._materialize_chunk(chunk_id)
+
+    def _materialize_chunk(self, chunk_id: str) -> Any:
+        """JSON-decode a single chunk's raw row text (see
+        :class:`_LazyRawChunks`), caching the result. This is where the
+        per-row-kind parsing logic that used to run unconditionally in
+        `_extract_all` for every chunk now runs, but only for chunks that
+        are actually looked at."""
+        if chunk_id in self._materialized:
+            return self._materialized[chunk_id]
+        row_type = self._row_types[chunk_id]
+        raw_value = self._raw_row_text[chunk_id]
+        if row_type == "text":
+            value = raw_value
+        elif row_type in ("module", "preload"):
+            try:
+                value = _json_loads(raw_value)
+            except _JSON_ERRORS:
+                if self.strict:
+                    raise FlightParseError(
+                        f"chunk {chunk_id!r}: invalid {row_type} JSON: {raw_value[:80]!r}"
+                    )
+                value = raw_value
+        else:
+            if raw_value == "$undefined":
+                value = None
+            else:
+                try:
+                    value = _json_loads(raw_value)
+                except _JSON_ERRORS:
+                    if self.strict and not raw_value.startswith("$"):
+                        raise FlightParseError(
+                            f"chunk {chunk_id!r}: invalid JSON: {raw_value[:80]!r}"
+                        )
+                    value = raw_value  # bare marker e.g. "X"
+        self._materialized[chunk_id] = value
+        return value
 
     # ------------------------------------------------------------------ #
     # Step 3 -- resolve '$'-sigil references into real values, recursively.
@@ -607,6 +761,17 @@ class FlightExtractor:
         sigil, ref_id, path = m.group("sigil"), m.group("id"), m.group("path")
         if sigil == "S":
             return {"__symbol__": ref_id}
+        if sigil == "@":
+            # Async/Suspense placeholder marker (e.g. "$@5"): during
+            # streaming, this slot's real value arrives on a later chunk
+            # while this one renders a fallback in the meantime. By the
+            # time we're parsing a *completed* page or payload, chunk
+            # `ref_id` has already arrived along with everything else, so
+            # this resolves exactly like an ordinary reference ("$5")
+            # once that chunk is looked up below -- no special handling
+            # needed beyond documenting that this is intentional, not
+            # coincidental.
+            pass
         if ref_id not in self.raw_chunks:
             return s
         if ref_id in self._resolving:
@@ -640,7 +805,7 @@ class FlightExtractor:
         return value
 
     @staticmethod
-    def _walk_path(value: Any, parts: list) -> Any:
+    def _walk_path(value: Any, parts: list, default: Any = None) -> Any:
         for part in parts:
             if (
                 part == "props"
@@ -660,11 +825,13 @@ class FlightExtractor:
                 try:
                     value = value[int(part)]
                 except (ValueError, IndexError):
-                    return None
+                    return default
             elif isinstance(value, dict):
-                value = value.get(part)
+                if part not in value:
+                    return default
+                value = value[part]
             else:
-                return None
+                return default
         return value
 
     def resolve_all(self) -> dict:
@@ -733,12 +900,12 @@ class FlightExtractor:
             return _walk(self.resolve_chunk(chunk_id), 0)
         return {cid: _walk(v, 0) for cid, v in self.resolve_all().items()}
 
-    def diff(self, other: "FlightExtractor") -> dict:
+    def diff(self, other: "FlightExtractor", *, id_key: Optional[str] = None) -> dict:
         """Compare this page against another crawl (presumably of the same
         URL) and report what changed. Shorthand for
-        :func:`diff_pages(self, other) <diff_pages>` -- see there for
-        details and caveats."""
-        return diff_pages(self, other)
+        :func:`diff_pages(self, other, id_key=id_key) <diff_pages>` -- see
+        there for details, `id_key`, and caveats."""
+        return diff_pages(self, other, id_key=id_key)
 
     # ------------------------------------------------------------------ #
     # Step 4 -- schema-free search over the fully resolved data.
@@ -911,25 +1078,43 @@ class FlightExtractor:
         return matches
 
     def get(self, path: str, default: Any = None, sep: str = ".") -> Any:
-        """Navigate the fully resolved page with a dotted path of dict keys
+        """Navigate the resolved page with a dotted path of dict keys
         and/or list indices, e.g. ``page.get("3f.props.product.price")`` or
         ``page.get("items.0.name")``. Returns `default` if any segment is
         missing, instead of raising -- meant for quick, tolerant lookups
-        once you already know roughly where something lives on this site."""
-        current: Any = self.resolve_all()
-        for part in path.split(sep):
-            if isinstance(current, dict):
-                if part not in current:
-                    return default
-                current = current[part]
-            elif isinstance(current, list):
-                try:
-                    current = current[int(part)]
-                except (ValueError, IndexError):
-                    return default
-            else:
-                return default
-        return current
+        once you already know roughly where something lives on this site.
+
+        Also understands the same symbolic ``"props"`` segment that
+        `$`-ref paths use to address a React element's props (e.g.
+        ``"29.3.props.adMetrics.0.title"``, where index 3 of that
+        four-element ``["$", type, key, props]`` list *is* props) -- see
+        `_walk_path` -- so navigating resolved data by hand behaves the
+        same way references into it do internally.
+
+        Only the chunk the path actually starts from (`"3f"` above) gets
+        resolved -- not every chunk on the page -- so looking up a handful
+        of known paths with `.get()`/:meth:`select` doesn't pay to resolve
+        chunks the path never touches."""
+        parts = path.split(sep)
+        if not parts or parts[0] not in self.raw_chunks:
+            return default
+        current: Any = self.resolve_chunk(parts[0])
+        return self._walk_path(current, parts[1:], default=default)
+
+    def select(self, *paths: str, default: Any = None, sep: str = ".") -> dict:
+        """Resolve just the specific dotted paths you ask for --
+        ``page.select("3f.props.price", "3f.props.title", "9.currency")``
+        -- instead of the whole page. Returns ``{path: value}`` (using
+        `default` for any path that doesn't exist, same as :meth:`get`).
+
+        This is the general form of :meth:`resolve_json` /
+        :meth:`resolve_html` / :meth:`resolve_text`, which give you a
+        whole *kind* of chunk; `select` gives you exactly the fields you
+        name, however many chunks that happens to touch, and nothing
+        else -- the natural tool once you know precisely where the data
+        you want lives (e.g. from a first exploratory pass with
+        :meth:`shape` or :meth:`find_by_keys`)."""
+        return {p: self.get(p, default=default, sep=sep) for p in paths}
 
     def stats(self) -> dict:
         """A quick diagnostic snapshot -- handy the first time you point
@@ -1101,30 +1286,55 @@ def detect_next_router(html: Any) -> str:
     return "unknown"
 
 
-def _flatten_for_diff(data: Any, prefix: str = "") -> dict:
-    """Flatten a nested dict/list into ``{dotted.path: scalar_or_empty}``,
+def _flatten_for_diff(data: Any, prefix: str = "", id_key: Optional[str] = None) -> dict:
+    """Flatten a nested dict/list into ``{path: scalar_or_empty}``,
     recursing into non-empty dicts/lists and stopping at scalars (or empty
     containers, which are kept as leaf values so an emptied-out list/dict
-    still shows up as a change). Internal helper for :func:`diff_pages`."""
+    still shows up as a change). Internal helper for :func:`diff_pages`.
+
+    When `id_key` is given and a list's elements are all dicts containing
+    that key, list elements are addressed by `[id_key=value]` instead of
+    by position (`adMetrics[listing_id=7165546].price` instead of
+    `adMetrics.3.price`) -- see :func:`diff_pages` for why that matters."""
     flat: dict = {}
     if isinstance(data, dict) and data:
         for k, v in data.items():
-            flat.update(_flatten_for_diff(v, f"{prefix}.{k}" if prefix else str(k)))
+            child_prefix = f"{prefix}.{k}" if prefix else str(k)
+            flat.update(_flatten_for_diff(v, child_prefix, id_key))
     elif isinstance(data, list) and data:
+        use_id = bool(id_key) and all(
+            isinstance(item, dict) and id_key in item for item in data
+        )
         for i, v in enumerate(data):
-            flat.update(_flatten_for_diff(v, f"{prefix}.{i}" if prefix else str(i)))
+            if use_id:
+                child_prefix = f"{prefix}[{id_key}={v[id_key]!r}]"
+            else:
+                child_prefix = f"{prefix}.{i}" if prefix else str(i)
+            flat.update(_flatten_for_diff(v, child_prefix, id_key))
     else:
         flat[prefix or "$"] = data
     return flat
 
 
-def diff_pages(old: "FlightExtractor", new: "FlightExtractor") -> dict:
+def diff_pages(old: "FlightExtractor", new: "FlightExtractor", *, id_key: Optional[str] = None) -> dict:
     """Compare two crawls of (presumably) the same URL and report what
-    changed, scalar-by-scalar, by dotted path -- e.g. for a price/stock
+    changed, scalar-by-scalar, by path -- e.g. for a price/stock
     monitoring pipeline that re-scrapes a page periodically.
 
     Returns ``{"added": {path: value}, "removed": {path: value}, "changed":
     {path: (old_value, new_value)}}``.
+
+    By default, list elements are addressed by position (`items.3.price`),
+    which means inserting or removing a single element shifts every
+    later index and makes everything after it look "changed" even though
+    it didn't. If your data has a stable identifier -- a `listing_id`,
+    `id`, `sku`, etc. -- pass it as `id_key` and lists of dicts containing
+    that key are addressed by value instead (`items[listing_id=123].price`),
+    so reordering or inserting elsewhere in the list no longer produces
+    spurious diffs for unrelated items. Only applies to lists where every
+    element is a dict containing `id_key`; lists that don't match (mixed
+    types, or missing the key on some elements) still fall back to
+    positional indexing.
 
     Caveat: Flight chunk ids are arbitrary per build (a redeploy can
     renumber them), and this diffs *fully resolved* data by path within
@@ -1135,8 +1345,8 @@ def diff_pages(old: "FlightExtractor", new: "FlightExtractor") -> dict:
     triage, not a guaranteed clean diff across arbitrary redeploys -- it's
     most reliable when comparing two crawls close together in time (e.g.
     polling the same live build every few minutes)."""
-    old_flat = _flatten_for_diff(old.resolve_all())
-    new_flat = _flatten_for_diff(new.resolve_all())
+    old_flat = _flatten_for_diff(old.resolve_all(), id_key=id_key)
+    new_flat = _flatten_for_diff(new.resolve_all(), id_key=id_key)
     old_keys, new_keys = old_flat.keys(), new_flat.keys()
     return {
         "added": {k: new_flat[k] for k in new_keys - old_keys},

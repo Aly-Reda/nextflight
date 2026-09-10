@@ -108,6 +108,57 @@ def test_get_dotted_path():
     assert page.get("nope.at.all", "missing") == "missing"
 
 
+def test_get_single_segment_path_returns_whole_chunk():
+    html = '<script>self.__next_f.push([1, "3f:{\\"a\\":1}"])</script>'
+    page = FlightExtractor(html)
+    assert page.get("3f") == {"a": 1}
+
+
+def test_get_understands_props_field_on_react_element_tuples():
+    # .get()/select() should understand the same symbolic "props" segment
+    # that $-ref paths use internally (see _walk_path), so navigating
+    # resolved data by hand is consistent with how references resolve it.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:[\\"$\\",\\"$L1\\",null,{\\"adMetrics\\":[{\\"title\\":\\"Car\\"}]}]"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.get("0.props.adMetrics.0.title") == "Car"
+
+
+def test_get_only_materializes_the_chunk_the_path_starts_from():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:{\\"b\\":2}\\n2:{\\"props\\":{\\"price\\":100}}"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.get("2.props.price") == 100
+    assert set(page._materialized.keys()) == {"2"}
+
+
+def test_select_returns_dict_of_requested_paths():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:{\\"b\\":2}\\n2:{\\"props\\":{\\"price\\":100,\\"title\\":\\"x\\"}}"'
+        '])</script>'
+    )
+    page = extract(html)
+    result = page.select("2.props.price", "2.props.title", "0.a")
+    assert result == {"2.props.price": 100, "2.props.title": "x", "0.a": 1}
+    # chunk "1" was never referenced by any requested path -- select()
+    # should not have touched it.
+    assert "1" not in page._materialized
+
+
+def test_select_uses_default_for_missing_paths():
+    html = '<script>self.__next_f.push([1, "0:{\\"a\\":1}"])</script>'
+    page = extract(html)
+    result = page.select("0.a", "0.missing", default="N/A")
+    assert result == {"0.a": 1, "0.missing": "N/A"}
+
+
 def test_stats():
     html = r'''
     <script>self.__next_f.push([1, "1:{\"a\":1}"])</script>
@@ -667,7 +718,58 @@ def test_page_diff_method_matches_diff_pages_function():
     assert old_page.diff(new_page) == diff_pages(old_page, new_page)
 
 
-# ------------------------------------------------------------------ #
+def test_diff_pages_id_key_avoids_spurious_reorder_diffs():
+    from nextflight import diff_pages
+
+    old_listings = [
+        {"listing_id": 1, "price": 100},
+        {"listing_id": 2, "price": 200},
+    ]
+    new_listings = [
+        {"listing_id": 99, "price": 999},  # inserted at the front
+        {"listing_id": 1, "price": 100},   # unchanged, but shifted
+        {"listing_id": 2, "price": 250},   # genuinely changed
+    ]
+    old_html = (
+        '<script>self.__next_f.push([1, "0:' +
+        json.dumps({"items": old_listings}).replace('"', '\\"') +
+        '"])</script>'
+    )
+    new_html = (
+        '<script>self.__next_f.push([1, "0:' +
+        json.dumps({"items": new_listings}).replace('"', '\\"') +
+        '"])</script>'
+    )
+    old_page, new_page = extract(old_html), extract(new_html)
+
+    # Positional (default) diffing sees the shift as changes to every
+    # field of every shifted element, not just the one real change.
+    positional = diff_pages(old_page, new_page)
+    assert len(positional["changed"]) > 1
+
+    # Identity-based diffing sees exactly the one real change, plus the
+    # genuinely new listing -- the shift itself produces no noise.
+    by_id = diff_pages(old_page, new_page, id_key="listing_id")
+    assert by_id["changed"] == {"0.items[listing_id=2].price": (200, 250)}
+    assert set(by_id["added"].keys()) == {
+        "0.items[listing_id=99].listing_id",
+        "0.items[listing_id=99].price",
+    }
+    assert by_id["removed"] == {}
+
+
+def test_diff_pages_id_key_falls_back_to_positional_for_non_matching_lists():
+    from nextflight import diff_pages
+
+    # Not every element has the id_key -- must fall back to positional
+    # indexing for this list rather than crashing or silently dropping data.
+    old_html = '<script>self.__next_f.push([1, "0:[{\\"id\\":1},{\\"x\\":2}]"])</script>'
+    new_html = '<script>self.__next_f.push([1, "0:[{\\"id\\":1},{\\"x\\":3}]"])</script>'
+    old_page, new_page = extract(old_html), extract(new_html)
+    result = diff_pages(old_page, new_page, id_key="id")
+    assert result["changed"] == {"0.1.x": (2, 3)}
+
+
 # iter_resolved
 # ------------------------------------------------------------------ #
 def test_iter_resolved_matches_resolve_all():
@@ -832,6 +934,46 @@ def test_cli_redact(tmp_path):
     assert "[REDACTED_EMAIL]" in result.stdout
 
 
+def test_cli_rsc_requires_url_source(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text('<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>')
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--rsc", "--all"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "requires a URL" in result.stderr
+
+
+def test_cli_rsc_flag_fetches_raw_rsc_payload():
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b'1:"$Sreact.fragment"\n0:{"a":1}')
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_port
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "nextflight.cli", f"http://127.0.0.1:{port}/page", "--rsc", "--all"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        assert json.loads(result.stdout) == {"1": {"__symbol__": "react.fragment"}, "0": {"a": 1}}
+    finally:
+        server.shutdown()
+        thread.join(timeout=3)
+
+
 # ------------------------------------------------------------------ #
 # resolve_json / resolve_html / resolve_text
 # ------------------------------------------------------------------ #
@@ -987,6 +1129,23 @@ def test_ref_path_repeated_self_reference_does_not_loop_forever():
     assert resolved[1] == {"a": 42, "b": 42}
 
 
+def test_async_placeholder_sigil_resolves_same_as_plain_ref():
+    # The "@" sigil marks an async/Suspense placeholder ("$@5" = "the
+    # value that streams in on chunk 5 later"). Once the full page has
+    # arrived (as it has by the time we're parsing it), that chunk is
+    # already present, so "$@5" should resolve identically to a plain
+    # "$5" reference to the same chunk -- not specially, not to None.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"5:{\\"value\\":42}\\n'
+        '0:{\\"async_slot\\":\\"$@5\\",\\"plain_ref\\":\\"$5\\"}"'
+        '])</script>'
+    )
+    page = extract(html)
+    resolved = page.resolve_chunk("0")
+    assert resolved["async_slot"] == resolved["plain_ref"] == {"value": 42}
+
+
 # ------------------------------------------------------------------ #
 # Raw RSC-fetch payloads: no HTML, no self.__next_f.push() wrapper --
 # just the Flight row stream directly as the response body. This is what
@@ -1064,3 +1223,175 @@ def test_raw_rsc_payload_with_text_rows_and_named_refs():
     page = extract(raw)
     assert page.resolve_chunk("0")[1][3] == {"filters": {"page": 2}}
     assert page.resolve_chunk("5") == "hello"
+
+
+# ------------------------------------------------------------------ #
+# Lazy row materialization: JSON-decoding a chunk's raw row text should
+# happen on first access, not unconditionally for every chunk at
+# construction time.
+# ------------------------------------------------------------------ #
+def test_construction_does_not_eagerly_materialize_chunks():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:{\\"b\\":2}\\n2:{\\"c\\":3}"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page._materialized == {}
+    assert page.resolve_chunk("1") == {"b": 2}
+    assert set(page._materialized.keys()) == {"1"}
+
+
+def test_find_by_keys_only_materializes_chunks_up_to_the_match():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"id\\":1}\\n1:{\\"price\\":100,\\"title\\":\\"x\\"}\\n2:{\\"id\\":3}"'
+        '])</script>'
+    )
+    page = extract(html)
+    result = page.find_by_keys({"price", "title"})
+    assert result == {"price": 100, "title": "x"}
+    assert set(page._materialized.keys()) == {"0", "1"}
+    assert "2" not in page._materialized
+
+
+def test_raw_chunks_is_dict_like_lazy_mapping():
+    html = '<script>self.__next_f.push([1, "0:{\\"a\\":1}\\n1:{\\"b\\":2}"])</script>'
+    page = extract(html)
+    assert "0" in page.raw_chunks
+    assert "missing" not in page.raw_chunks
+    assert len(page.raw_chunks) == 2
+    assert list(page.raw_chunks) == ["0", "1"]
+    assert page.raw_chunks["1"] == {"b": 2}
+    assert page.raw_chunks.get("missing") is None
+    assert page.raw_chunks.get("missing", "default") == "default"
+    with pytest.raises(KeyError):
+        page.raw_chunks["missing"]
+    assert dict(page.raw_chunks.items()) == {"0": {"a": 1}, "1": {"b": 2}}
+
+
+def test_strict_mode_still_validates_eagerly_at_construction():
+    # strict=True is an explicit opt-in to fail-fast validation of the
+    # WHOLE page, not just chunks that happen to get accessed -- laziness
+    # must not weaken that guarantee.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"ok\\":1}\\n1:not valid json and not a $ marker"'
+        '])</script>'
+    )
+    with pytest.raises(FlightParseError):
+        extract(html, strict=True)
+    # chunk "1" is never accessed above -- construction itself must still
+    # have caught it, proving strict mode materializes every chunk eagerly.
+    page = extract(html, strict=False)
+    assert page.raw_chunks["1"] == "not valid json and not a $ marker"
+
+
+# ------------------------------------------------------------------ #
+# from_url / from_rsc_url: content-encoding handling and _rsc
+# auto-discovery, against a real local HTTP server (not mocked) so the
+# actual request/response path is exercised end to end.
+# ------------------------------------------------------------------ #
+def _run_local_server(handler_cls):
+    """Start a local HTTPServer with `handler_cls` on an ephemeral port in
+    a background thread. Returns (server, port); caller must
+    server.shutdown() when done."""
+    import threading
+    from http.server import HTTPServer
+
+    server = HTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, server.server_port
+
+
+def test_from_url_transparently_decodes_gzip_response():
+    import gzip
+    from http.server import BaseHTTPRequestHandler
+
+    body = b"<html><body>hello from gzip</body></html>"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            compressed = gzip.compress(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            self.wfile.write(compressed)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _run_local_server(Handler)
+    try:
+        page = FlightExtractor.from_url(f"http://127.0.0.1:{port}/")
+        assert "hello from gzip" in page.html
+    finally:
+        server.shutdown()
+
+
+def test_from_rsc_url_auto_discovers_rsc_id_from_prefetch_link():
+    from http.server import BaseHTTPRequestHandler
+
+    seen = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.headers.get("RSC") == "1":
+                seen["path"] = self.path
+                seen["next_url"] = self.headers.get("Next-Url")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b'0:{"a":1}')
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b'<link rel="prefetch" href="/x?_rsc=abc123">')
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _run_local_server(Handler)
+    try:
+        page = FlightExtractor.from_rsc_url(f"http://127.0.0.1:{port}/car/search")
+        assert page.resolve_chunk("0") == {"a": 1}
+        assert "_rsc=abc123" in seen["path"]
+        assert seen["next_url"] == "/car/search"
+    finally:
+        server.shutdown()
+
+
+def test_from_rsc_url_auto_discover_false_skips_extra_fetch():
+    from http.server import BaseHTTPRequestHandler
+
+    plain_fetch_count = {"n": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.headers.get("RSC") == "1":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b'0:{"a":1}')
+                return
+            plain_fetch_count["n"] += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b'<link rel="prefetch" href="/x?_rsc=abc123">')
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _run_local_server(Handler)
+    try:
+        page = FlightExtractor.from_rsc_url(
+            f"http://127.0.0.1:{port}/car/search", auto_discover=False
+        )
+        assert page.resolve_chunk("0") == {"a": 1}
+        assert plain_fetch_count["n"] == 0
+    finally:
+        server.shutdown()

@@ -5,6 +5,7 @@ setup.cfg
 src/nextflight/__init__.py
 src/nextflight/cli.py
 src/nextflight/extractor.py
+src/nextflight/py.typed
 src/nextflight.egg-info/PKG-INFO
 src/nextflight.egg-info/SOURCES.txt
 src/nextflight.egg-info/dependency_links.txt

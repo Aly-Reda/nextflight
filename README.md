@@ -1,14 +1,24 @@
 # nextflight
 
-A general-purpose parser for the data Next.js (App Router) embeds in
-`<script>self.__next_f.push([...])</script>` tags — the React Server
-Components "Flight" wire format. Works on **any** Next.js 13+ App Router
-site, not just one particular project.
+**Extract JSON data from any Next.js (App Router) page in Python.**
 
-Instead of hardcoding array indices like `data[3]["children"][0][3]...`,
-which break the moment a site's component tree reshuffles on redeploy,
-`nextflight` resolves the `$`-sigil references Next.js uses internally
-and lets you *search* for the shape of data you want.
+`nextflight` parses the React Server Components ("Flight") payloads that
+Next.js embeds in server-rendered HTML — the
+`<script>self.__next_f.push([...])</script>` blocks, or the raw RSC
+response you get back from a request sent with an `RSC: 1` header — and
+turns them into clean, searchable Python dicts and lists. It works on
+**any** Next.js 13+ App Router site out of the box, with no per-site
+configuration, which makes it a natural fit for **web scraping**,
+**crawling**, and structured **data extraction** with Scrapy, requests,
+httpx, or the stdlib alone.
+
+Next.js pages don't put their data in one obvious place — it's spread
+across dozens of numbered chunks, cross-referenced with `$`-sigils, and
+reshuffled every time the site redeploys. Hardcoding array paths like
+`data[3]["children"][0][3]...` breaks the moment that happens.
+`nextflight` resolves those references for you and lets you *search* for
+the shape of data you want instead — `page.find_by_keys({"price",
+"title"})` instead of a brittle index chain.
 
 ## Install
 
@@ -16,56 +26,34 @@ and lets you *search* for the shape of data you want.
 pip install nextflight
 ```
 
+No required dependencies — stdlib only, so it drops into any existing
+Scrapy/Zyte project without touching your dependency tree. A few optional
+extras unlock extra features automatically if installed; see
+[Optional dependencies](#optional-dependencies).
+
 ## Quick start
 
-The core workflow is two steps: hand it any HTML, see what keys are on
-the page, then fetch the resolved JSON for whichever key you want.
+Two steps: see what's on the page, then fetch the shape of data you want.
 
 ```python
 from nextflight import extract
 
-# Step 1: send any HTML, get the list of keys (one per __next_f.push chunk)
-page = extract(html_text)
-print(page.keys())          # e.g. ['0', '1', '3f', '20', ...]
+page = extract(html_text)      # a string, bytes, or response object
 
-# Step 2: fetch the resolved JSON for a specific key
-data = page["3f"]           # same as page.resolve_chunk("3f")
+page.keys()                    # ['0', '1', '3f', '20', ...] -- what's here
+page["3f"]                     # the resolved JSON for one specific chunk
+
+# In practice, chunk ids are arbitrary per build (they change on
+# redeploy), so search for the shape of data you want instead:
+listing = page.find_by_keys({"price", "title"})       # first match
+listings = page.find_all_by_keys({"price", "title"})  # every match
+products = page.find_by_type("Product")               # by @type
+everything = page.resolve_all()                        # everything, dereferenced
 ```
 
-Chunk ids are arbitrary per build though (a redeploy can renumber them),
-so in practice you'll usually skip straight to *searching* for the shape
-of data you want instead of a specific id:
+## Usage
 
-```python
-from nextflight import extract
-
-page = extract(html_text)
-
-# Find the first object anywhere in the page that has all of these keys,
-# wherever this build's component tree happened to put it:
-listing = page.find_by_keys({"sections", "meta"})
-
-# Find every node with a given @type (or any custom key):
-products = page.find_by_type("Product")
-
-# Or search with a fully custom predicate:
-items = page.find_all(lambda n: isinstance(n, dict) and "price" in n)
-
-# Or grab everything, fully dereferenced, and inspect by hand:
-everything = page.resolve_all()
-```
-
-### Command line
-
-For quick, no-script exploration of a page you've already saved (or a live URL):
-
-```bash
-nextflight page.html --keys sections,meta
-nextflight https://example.com/product/123 --type Product
-nextflight page.html --all > everything.json
-```
-
-### In a Scrapy / Zyte spider
+### In a Scrapy spider
 
 ```python
 import scrapy
@@ -76,11 +64,7 @@ class MySpider(scrapy.Spider):
 
     def parse(self, response):
         page = extract(response.text)
-
-        items = page.find_all(
-            lambda n: isinstance(n, dict) and "price" in n and "title" in n
-        )
-        for item in items:
+        for item in page.find_all_by_keys({"price", "title"}):
             yield {
                 "title": item.get("title"),
                 "price": item.get("price"),
@@ -97,57 +81,52 @@ page = FlightExtractor.from_url("https://example.com/product/123")
 product = page.find_by_keys({"price", "title"})
 ```
 
-(`from_url` uses only the stdlib for quick one-off exploration. For
-production crawling — retries, proxies, JS rendering, robots.txt — fetch
-the page with your own HTTP client / Scrapy / Zyte and pass
-`response.text` to `FlightExtractor(...)` / `extract(...)` instead.)
+`from_url` uses only the stdlib, for quick exploration or lightweight
+crawling. For anything needing retries, proxies, JS rendering, or
+robots.txt handling, fetch the page with your own HTTP client and pass
+`response.text` to `extract(...)` instead.
 
 ### Raw RSC fetches (no HTML at all)
 
 Sending a request with an `RSC: 1` header — the way Next.js's own
-client-side navigation does it — gets back the raw Flight row stream
-directly as the response body, with no surrounding HTML and no
-`self.__next_f.push(...)` wrapper. `extract()` detects and parses this
-automatically, exactly the same as the HTML-embedded form:
+client-side navigation does — returns the raw Flight row stream directly
+as the response body, with no HTML wrapper. `extract()` detects and
+parses this automatically, same as the HTML-embedded form:
 
 ```python
 from nextflight import FlightExtractor
 
-# Convenience constructor: sets the RSC header for you
+# Sets RSC:1 and Next-Url for you, and best-effort auto-discovers a
+# build-specific _rsc=<id> from the page's own prefetch links
 page = FlightExtractor.from_rsc_url("https://example.com/car/search?page=2")
 
-# Or bring your own client (requests, httpx, Scrapy, ...):
+# Or bring your own client:
 import requests
 resp = requests.get(
     "https://example.com/car/search",
-    params={"page": "2", "_rsc": "1p28d"},  # build-specific cache key from the page's own JS
+    params={"page": "2", "_rsc": "1p28d"},   # a build-specific cache key
     headers={"RSC": "1", "Next-Url": "/en/car/search"},
 )
 page = FlightExtractor(resp.text)
 ```
 
-Some deployments require extra headers to serve the RSC payload instead
-of redirecting to the full HTML page or rejecting the request — a
-matching `Next-Router-State-Tree` header, a `next-url` header pointing at
-the page itself, or a build-specific `_rsc=<id>` query parameter (grab it
-from the page's own client-side JS/network tab; it changes across
-deploys). Copy whatever a real browser sends for that specific site if
-the bare `RSC: 1` header alone doesn't work.
+If a site also requires a `Next-Router-State-Tree` header, grab it once
+from a real browser's network tab and reuse it — it's stable for every
+request to the *same route* regardless of query params, so it doesn't
+need to be regenerated per request.
 
 ### Pages Router support
 
-Not every Next.js site uses the App Router. Older / mixed deployments
-often use the Pages Router's `__NEXT_DATA__` blob instead, which is
-already plain JSON:
+Older or mixed Next.js deployments use the Pages Router's `__NEXT_DATA__`
+blob instead of Flight — already plain JSON, no `$`-refs to resolve:
 
 ```python
 from nextflight import extract, find_next_data, detect_next_router
 
-router = detect_next_router(html_text)  # "app" | "pages" | "both" | "unknown"
+router = detect_next_router(html_text)   # "app" | "pages" | "both" | "unknown"
 
 if router == "app":
-    page = extract(html_text)
-    data = page.find_by_keys({"price", "title"})
+    data = extract(html_text).find_by_keys({"price", "title"})
 else:
     data = find_next_data(html_text)["props"]["pageProps"]
 ```
@@ -155,7 +134,7 @@ else:
 ### Monitoring a page over time
 
 `diff_pages` compares two crawls of the same URL and reports what
-changed, by dotted path — handy for a price/stock watcher:
+changed — handy for a price or stock watcher:
 
 ```python
 from nextflight import FlightExtractor, diff_pages
@@ -164,214 +143,187 @@ old_page = FlightExtractor.from_url(url)
 # ...re-fetch later...
 new_page = FlightExtractor.from_url(url)
 
-changes = diff_pages(old_page, new_page)
+diff_pages(old_page, new_page)
 # {"added": {...}, "removed": {...}, "changed": {"path.to.price": (100, 90)}}
 ```
 
-Or from the command line, polling continuously:
+For a list of records with a stable id, pass `id_key` — otherwise
+inserting one new item shifts every later index and makes everything
+after it look changed even though it didn't:
 
+```python
+diff_pages(old_page, new_page, id_key="listing_id")
+# {"changed": {"items[listing_id=7165546].price": (929900, 899900)}, ...}
 ```
+
+Or from the command line, polling continuously (`--rsc` for the
+lighter-weight RSC payload instead of full HTML each poll):
+
+```bash
 nextflight https://example.com/product/123 --watch 60
+nextflight https://example.com/car/search --rsc --watch 60
 ```
 
-### Exporting to a DataFrame / CSV
+### Exporting to a DataFrame or CSV
 
 ```python
 page = extract(html_text)
 
-df = page.to_dataframe(required_keys={"id", "price"})   # requires pandas
+df = page.to_dataframe(required_keys={"id", "price"})       # requires pandas
 page.to_csv("listings.csv", required_keys={"id", "price"})  # works either way
 ```
 
-## API
+### Command line
 
-- **`extract(html) -> FlightExtractor`** — shorthand constructor. `html`
-  accepts a plain string, bytes, or a response-like object (Scrapy's
-  `Response`, `requests.Response`, etc.) — pass `response` straight from a
-  `parse()` method without writing `response.text` yourself.
-- **`FlightExtractor(html, *, strict: bool = False)`**
-  - `.keys() -> list[str]` — every chunk id found on the page, in order.
-  - `.json_keys() -> list[str]` — chunk ids whose raw value is structured
-    JSON (a dict or list), i.e. the ones you almost always want.
-  - `.html_keys() -> list[str]` — chunk ids from Flight text (`T`) rows
-    that look like an HTML fragment (contain a tag) — suspense fallbacks,
-    error boundaries, inlined SVGs, and other raw markup Next.js streams
-    outside the JSON chunks.
-  - `.text_keys() -> list[str]` — every chunk id from a text (`T`) row,
-    HTML-looking or not (plain copy, translated strings, etc).
-  - `.kind(chunk_id) -> str | None` — which Flight row kind a chunk came
-    from (`"json"`, `"text"`, `"module"`, `"preload"`), or `None` if the id
-    doesn't exist. This is what `json_keys()` / `html_keys()` / `text_keys()`
-    filter on.
-  - `.find_any_keys(any_keys, root=None, include_source=False) -> list` —
-    like `find_all_by_keys` but matches a dict containing ANY of `any_keys`
-    rather than requiring all of them.
-  - `.find_by_key_pattern(pattern, root=None, include_source=False) -> list`
-    — find every dict with at least one key matching a regex `pattern`
-    (e.g. `r"^price_"` to catch `price_usd`, `price_aed`, ...).
-  - `include_source=True` on any `find_*` method returns `(node, chunk_id)`
-    tuples instead of bare nodes, so you can trace a match back to roughly
-    where it came from (or re-fetch just that chunk on a future crawl).
-  - `.iter_resolved() -> Iterator[(chunk_id, value)]` — like `resolve_all()`
-    but lazy, one chunk at a time, for bailing out early on very large pages.
-  - `.shape(chunk_id=None, max_depth=3) -> Any` — a compact summary of the
-    resolved data's *structure* (key names + value types, lists collapsed to
-    their first element) instead of full values — for getting a feel for an
-    unfamiliar site fast. Omit `chunk_id` to summarize every chunk.
-  - `.diff(other_page) -> dict` / `diff_pages(old, new) -> dict` — compare
-    two crawls of the same URL and report `{"added", "removed", "changed"}`
-    by dotted path — handy for price/stock-monitoring pipelines. See the
-    caveat about chunk ids reshuffling across redeploys in the docstring.
-  - `.to_dataframe(records=None, required_keys=None)` / `.to_csv(path, ...)`
-    — build a pandas DataFrame or write a CSV from a list of dict records
-    (or run `find_all_by_keys(required_keys)` for you first). `to_csv` falls
-    back to the stdlib `csv` module if pandas isn't installed.
-  - `.from_url_async(url, ...)` (async classmethod) — async counterpart to
-    `from_url`, for concurrent multi-page crawls with `asyncio.gather(...)`.
-    Requires `httpx` (optional).
-  - `.from_rsc_url(url, headers=None, cookies=None, ...)` — fetch a raw RSC
-    payload directly (sets the `RSC: 1` header for you) instead of the full
-    HTML page. See "Raw RSC fetches" above.
-  - `page["3f"]` / `.resolve_chunk("3f")` — the resolved JSON for one
-    specific chunk id (`page[...]` raises `KeyError` if it doesn't exist;
-    `resolve_chunk` returns `None`). `"3f" in page` and `for k in page`
-    also work, like a dict.
-  - `.resolve_all() -> dict` — every chunk, fully dereferenced.
-  - `.resolve_json() -> dict` — only the chunks whose raw value is
-    structured JSON (see `json_keys()`). Skips top-level text/HTML-only
-    chunks that aren't referenced from any JSON chunk, so it's cheaper
-    than `resolve_all()` on pages with a lot of raw markup/text rows.
-  - `.resolve_html() -> dict` / `.resolve_text() -> dict` — the mirror
-    image: resolve only `html_keys()` / `text_keys()`.
-  - `.find_all(predicate, root=None, max_results=None) -> list` — walk the
-    resolved tree and collect every node matching `predicate`. With no
-    `root`, chunks are resolved lazily one at a time (via
-    `iter_resolved()`), so `max_results` stops *resolving* further chunks
-    the moment enough matches are found, not just stops searching.
-  - `.find_one(predicate, root=None) -> Any | None`
-  - `.find_by_keys(required_keys, root=None) -> dict | None` — find the
-    first dict containing all of `required_keys`.
-  - `.find_all_by_keys(required_keys, root=None) -> list` — like
-    `find_by_keys` but returns every match, for pages with repeated
-    cards/listings that share the same shape.
-  - `.find_by_type(type_value, key="@type", root=None) -> list` — find
-    every dict whose `key` field equals `type_value`.
-  - `.find_text(pattern, root=None) -> list` — regex-search every string
-    value on the page and return the distinct whole values that contain a
-    match (emails, prices, phone numbers, SKUs, ...) without needing to
-    know which object they live on.
-  - `.get("path.to.value", default=None) -> Any` — tolerant dotted-path
-    lookup into the resolved page (dict keys and/or list indices), once
-    you already know roughly where something lives on this site.
-  - `.stats() -> dict` — quick diagnostic snapshot (chunk count, ids,
-    value type counts, Flight row kind counts, json/html chunk counts,
-    page size) for exploring a new site.
-  - `.to_json(path=None, indent=2) -> str | None` — dump the fully
-    resolved page to a file, or return it as a JSON string.
-  - `.from_url(url, timeout=15.0, headers=None) -> FlightExtractor`
-    (classmethod) — fetch and parse a URL using only the stdlib.
-  - `strict=True` raises `FlightParseError` on a row that's neither valid
-    JSON nor a recognizable `$`-reference marker, instead of silently
-    keeping it as a raw string (useful while developing a new scraper;
-    leave off in production so a handful of odd rows never take down
-    extraction of everything else on the page).
-- **`find_json_ld(html, type_=None) -> list`** — parse any
-  `<script type="application/ld+json">` blocks on the page, optionally
-  filtered by `@type`. Also accepts response-like objects.
-- **`find_next_data(html) -> dict | None`** — parse the **Pages Router**'s
-  `__NEXT_DATA__` JSON blob (Next.js's pre-App-Router data mechanism).
-  Already plain JSON, no `$`-ref resolution needed, so there's no
-  extractor class for it, just this function. Returns `None` if the page
-  doesn't have one (e.g. it's an App Router page — use `extract()` there
-  instead).
-- **`detect_next_router(html) -> str`** — best-effort guess at which
-  router rendered a page: `"app"`, `"pages"`, `"both"` (rare, e.g.
-  mid-migration sites), or `"unknown"`. Run this first if you're not sure
-  which of `extract()` / `find_next_data()` to reach for.
-- **`diff_pages(old, new) -> dict`** — module-level version of `.diff()`,
-  same thing.
-- **CLI**: `nextflight <file-or-url> [--keys a,b | --all-by-keys a,b | --any-keys a,b | --type Product | --text PATTERN | --get path.to.value | --json-keys | --html-keys | --tree | --router | --next-data | --stats | --watch SECONDS | --all] [--redact] [--save out.json]`
-  - `--tree` prints `.shape()` instead of full values.
-  - `--router` / `--next-data` cover Pages Router pages (see above).
-  - `--watch SECONDS` polls a URL and prints only what changed since the
-    last poll (via `diff_pages`) — a quick way to eyeball whether a site's
-    data-monitoring pipeline is worth building before you build it.
-  - `--redact` best-effort scrubs email/phone-shaped strings from output,
-    for sharing debug dumps.
+```bash
+nextflight page.html --keys sections,meta
+nextflight https://example.com/product/123 --type Product
+nextflight page.html --tree                 # shape summary, no full values
+nextflight page.html --all > everything.json
+```
 
-No *required* runtime dependencies — stdlib only (`json`, `re`, `urllib`,
-`argparse`) — so it's safe to drop into any existing Scrapy/Zyte project
-without touching the rest of your dependency tree. Optional accelerators/
-integrations, used automatically if already installed, otherwise skipped
-or raising a clear `ImportError` only if you call the specific method that
-needs them:
+## API reference
 
-| Package  | Used for                                    | Install                       |
-|----------|----------------------------------------------|-------------------------------|
-| `orjson` | faster JSON decoding everywhere               | `pip install nextflight[fast]`   |
-| `pandas` | `.to_dataframe()`, nicer `.to_csv()`          | `pip install nextflight[pandas]` |
-| `httpx`  | `.from_url_async()`                           | `pip install nextflight[async]`  |
+### `extract(html) -> FlightExtractor`
 
-(or `pip install nextflight[all]` for all three.)
+Shorthand constructor. `html` accepts a plain string, bytes, or a
+response-like object (Scrapy's `Response`, `requests.Response`, etc.) —
+pass `response` straight from a `parse()` method.
 
-### Upgrading from `nextjs-flight-extractor` / `NextFlightExtractor`
+### `FlightExtractor(html, *, strict=False)`
 
-The old names still work but emit a `DeprecationWarning`:
+`strict=True` raises `FlightParseError` on a row that's neither valid
+JSON nor a recognizable `$`-reference, instead of keeping it as a raw
+string. Useful while developing a new scraper; leave off in production so
+a handful of odd rows never take down extraction of everything else.
 
-| Old (0.1.x)                          | New (0.2.x+)                     |
-|---------------------------------------|----------------------------------|
-| `from nextjs_flight_extractor import NextFlightExtractor` | `from nextflight import FlightExtractor` |
-| `extractor.find_first(...)`           | `page.find_one(...)`            |
-| `extract_json_ld(html, schema_type=…)`| `find_json_ld(html, type_=…)`   |
+**Exploring a page**
 
-## Performance
+| Method | Returns | What it does |
+|---|---|---|
+| `.keys()` | `list[str]` | Every chunk id on the page, in order |
+| `.kind(chunk_id)` | `str \| None` | Row kind: `"json"`, `"text"`, `"module"`, `"preload"` |
+| `.json_keys()` | `list[str]` | Chunk ids holding structured JSON (dict/list) |
+| `.html_keys()` | `list[str]` | Text-row chunk ids that look like HTML fragments |
+| `.text_keys()` | `list[str]` | All text-row chunk ids, HTML-looking or not |
+| `.shape(chunk_id=None, max_depth=3)` | structure summary | Key names + value types, not values — get a feel for a new site fast |
+| `.stats()` | `dict` | Chunk count, row-kind breakdown, page size |
 
-Parsing is designed to be roughly linear in the size of the page, even on
-pages with hundreds or thousands of Flight rows:
+**Resolving data** (dereferencing `$`-refs)
 
-- **Text (`T`) rows no longer re-encode the rest of the payload on every
-  row.** Earlier versions read a text row's body with
-  `payload[body_start:].encode("utf-8")[:hex_len]`, which re-encodes the
-  *entire remainder* of the payload for every single text row. A page with
-  many text rows (translated copy, repeated card fragments, inlined SVGs)
-  made parsing effectively O(n²). It now reads only the bytes each row
-  actually needs, so parsing is O(n) again — roughly a 10x–20x speedup on
-  pages with thousands of text rows, and the gap grows with page size.
-- **No more O(n) string copies for bare/ref rows.** Locating the end of an
-  unbracketed value (a bare `$`-ref marker, number, etc.) used to slice
-  `payload[i:]` — copying the rest of the payload — before searching it.
-  It now searches in place with a `pos` argument instead.
-- **Optional `orjson` acceleration.** If `orjson` is already installed in
-  your environment (common in scraping stacks), `nextflight` will use it
-  automatically for JSON decoding — no configuration needed, and it's not
-  a required dependency. Falls back to the stdlib `json` module otherwise.
-- **`find_one`/`find_by_keys` stop *resolving*, not just searching, at the
-  first match.** These used to build `resolve_all()` — resolving every
-  chunk on the page — before the search even started, so `max_results=1`
-  only cut short the walk, not the resolution work leading up to it. They
-  now resolve chunks lazily (via `iter_resolved()`) and stop the moment a
-  match is found. On a page with thousands of unrelated chunks and the
-  match near the front, this measured 300x+ faster in testing (0.056s →
-  0.0002s on a 3,000-chunk synthetic page) — the gap scales with how many
-  chunks come *after* the match and how expensive they are to resolve.
-- **`resolve_json()` / `resolve_html()` / `resolve_text()`** for when you
-  only care about one kind of chunk and don't want to pay to resolve (and
-  allocate copies of) everything else on the page via `resolve_all()`.
+| Method | Returns | What it does |
+|---|---|---|
+| `page["id"]` / `.resolve_chunk("id")` | resolved value | One chunk, fully dereferenced (`page[...]` raises `KeyError` if missing) |
+| `.resolve_all()` | `dict` | Every chunk, fully dereferenced |
+| `.resolve_json()` / `.resolve_html()` / `.resolve_text()` | `dict` | Only one kind of chunk — cheaper than `resolve_all()` when you don't need everything |
+| `.iter_resolved()` | iterator | Like `resolve_all()` but lazy, one chunk at a time |
+| `.get("path.to.value", default=None)` | value | Tolerant dotted-path lookup (dict keys, list indices, and React element `"props"`) |
+| `.select(*paths, default=None)` | `dict` | Resolve just the named paths, e.g. `page.select("3f.props.price", "3f.props.title")` |
 
-## Why not just `str.split('\n')`?
+`"3f" in page` and `for k in page` also work, like a dict.
 
-Two of the Flight row kinds break that assumption:
+**Searching** (schema-free, works across redeploys)
 
-- **Text rows** (`id:T<hexByteLen>,<raw text>`) are byte-length-prefixed
-  blobs, not newline-terminated, and can contain literal newlines or run
-  directly into the next row's id with zero separator.
-- **Module / preload rows** (`id:I[...]` / `:HL[...]`) need bracket-aware
-  parsing.
+| Method | Returns | What it does |
+|---|---|---|
+| `.find_by_keys(required_keys, root=None)` | dict or `None` | First dict containing *all* of `required_keys` |
+| `.find_all_by_keys(required_keys, root=None)` | `list` | Every matching dict — for repeated cards/listings |
+| `.find_any_keys(any_keys, root=None)` | `list` | Every dict containing *any* of `any_keys` |
+| `.find_by_key_pattern(pattern, root=None)` | `list` | Every dict with a key matching a regex, e.g. `r"^price_"` |
+| `.find_by_type(type_value, key="@type", root=None)` | `list` | Every dict whose `key` field equals `type_value` |
+| `.find_text(pattern, root=None)` | `list` | Distinct string values matching a regex (emails, SKUs, ...) |
+| `.find_all(predicate, root=None, max_results=None)` | `list` | Fully custom predicate over every node |
+| `.find_one(predicate, root=None)` | value or `None` | Like `find_all` but just the first match |
 
-`nextflight` implements the real row grammar, quote/escape aware, so it
-holds up on both well-formed and truncated payloads (e.g. from a proxy
-that cuts a response off mid-chunk).
+Pass `include_source=True` on any `find_*` method to get `(node,
+chunk_id)` tuples instead of bare nodes, so you can trace a match back to
+where it came from. `find_all`/`find_one`/`find_by_keys` resolve chunks
+lazily and stop the moment `max_results` is hit — they don't pay to
+resolve chunks after a match is already found.
 
+**Fetching**
+
+| Classmethod | What it does |
+|---|---|
+| `.from_url(url, timeout=15.0, headers=None)` | Fetch and parse a URL, stdlib only |
+| `.from_url_async(url, ...)` | Async version for `asyncio.gather(...)` crawls — requires `httpx` |
+| `.from_rsc_url(url, headers=None, cookies=None, auto_discover=True)` | Fetch the raw RSC payload instead of full HTML — see "Raw RSC fetches" above |
+
+`from_url`/`from_rsc_url` transparently decompress gzip/deflate/br
+responses even if the server ignores the default `Accept-Encoding:
+identity` request.
+
+**Diffing and exporting**
+
+| Method | Returns | What it does |
+|---|---|---|
+| `.diff(other_page, id_key=None)` | `dict` | Compare against another crawl — see "Monitoring a page over time" |
+| `.to_json(path=None, indent=2)` | `str \| None` | Dump the fully resolved page to a file, or return as a string |
+| `.to_dataframe(records=None, required_keys=None)` | `DataFrame` | Requires pandas |
+| `.to_csv(path, records=None, required_keys=None)` | — | Falls back to the stdlib `csv` module without pandas |
+
+### Module-level functions
+
+- **`find_json_ld(html, type_=None) -> list`** — parse
+  `<script type="application/ld+json">` blocks, optionally filtered by
+  `@type`. Often more stable across redesigns than Flight data — worth
+  trying first for product/article/breadcrumb structured data.
+- **`find_next_data(html) -> dict | None`** — parse a Pages Router
+  `__NEXT_DATA__` blob. `None` if the page doesn't have one.
+- **`detect_next_router(html) -> str`** — `"app"`, `"pages"`, `"both"`, or
+  `"unknown"`. Run this first if you're not sure which extractor to use.
+- **`diff_pages(old, new, id_key=None) -> dict`** — module-level form of
+  `.diff()`.
+
+### Command-line reference
+
+```
+nextflight <file-or-url>
+  [--keys a,b | --all-by-keys a,b | --any-keys a,b
+   | --type Product | --text PATTERN | --get path.to.value
+   | --json-keys | --html-keys | --tree
+   | --router | --next-data | --stats | --watch SECONDS | --all]
+  [--rsc] [--redact] [--save out.json]
+```
+
+- `--tree` prints a `.shape()` summary instead of full values.
+- `--router` / `--next-data` cover Pages Router pages.
+- `--rsc` fetches the raw RSC payload instead of full HTML (URL sources
+  only) — lighter weight, also works with `--watch`.
+- `--watch SECONDS` polls a URL and prints only what changed since the
+  last poll.
+- `--redact` best-effort scrubs email/phone-shaped strings from output,
+  for sharing debug dumps.
+
+## Optional dependencies
+
+Nothing below is required to install or use `nextflight` — each is used
+automatically if already present in your environment, and raises a clear
+`ImportError` only if you call the one method that needs it.
+
+| Package | Unlocks | Install |
+|---|---|---|
+| `orjson` | Faster JSON decoding everywhere | `pip install nextflight[fast]` |
+| `pandas` | `.to_dataframe()`, nicer `.to_csv()` | `pip install nextflight[pandas]` |
+| `httpx` | `.from_url_async()` | `pip install nextflight[async]` |
+
+Or `pip install nextflight[all]` for all three.
+
+## How it works
+
+Flight payloads aren't newline-delimited JSON — text rows
+(`id:T<hexByteLen>,<raw bytes>`) are byte-length-prefixed and can contain
+literal newlines or run straight into the next row with no separator, and
+module/preload rows (`id:I[...]`, `id:HL[...]`) need bracket-aware
+parsing. `nextflight` implements the actual row grammar rather than
+splitting on `\n`, so it holds up on both well-formed pages and payloads
+truncated mid-chunk (e.g. by a proxy that cuts a response short).
+
+Parsing and resolution are both designed to scale roughly linearly with
+page size: rows are split cheaply up front, each chunk's JSON is decoded
+lazily on first access rather than all at once, and searches
+(`find_one`/`find_by_keys`) stop resolving chunks the moment a match is
+found instead of resolving the whole page first.
 
 ## License
 

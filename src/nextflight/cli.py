@@ -31,9 +31,11 @@ def _redact(text: str) -> str:
     return text
 
 
-def _load_html(source: str) -> str:
+def _load_html(source: str, use_rsc: bool = False) -> str:
     if source.startswith("http://") or source.startswith("https://"):
-        extractor = FlightExtractor.from_url(source)
+        extractor = (
+            FlightExtractor.from_rsc_url(source) if use_rsc else FlightExtractor.from_url(source)
+        )
         return extractor.html
     with open(source, "r", encoding="utf-8") as f:
         return f.read()
@@ -93,6 +95,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--indent", type=int, default=2, help="JSON indent for output (default 2).")
     parser.add_argument("--redact", action="store_true",
                          help="Redact email- and phone-shaped strings from the output (best-effort).")
+    parser.add_argument("--rsc", action="store_true",
+                         help="Fetch the page's raw RSC payload (an RSC: 1 request) instead of the "
+                              "full HTML page -- lighter weight, URL sources only. Auto-discovers a "
+                              "build-specific _rsc id from the page when present.")
     return parser
 
 
@@ -103,7 +109,7 @@ def _watch(args, parser) -> int:
     prev = None
     try:
         while True:
-            html = _load_html(args.source)
+            html = _load_html(args.source, use_rsc=args.rsc)
             current = FlightExtractor(html)
             timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
             if prev is None:
@@ -130,10 +136,14 @@ def main(argv=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    if args.rsc and not (args.source.startswith("http://") or args.source.startswith("https://")):
+        parser.error("--rsc requires a URL source.")
+        return 2
+
     if args.watch_seconds is not None:
         return _watch(args, parser)
 
-    html = _load_html(args.source)
+    html = _load_html(args.source, use_rsc=args.rsc)
 
     if args.router:
         _write_output(detect_next_router(html), args)

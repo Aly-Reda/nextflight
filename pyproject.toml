@@ -4,16 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nextflight"
-version = "0.3.3"
-description = "Parse Next.js App Router 'Flight' (__next_f.push) payloads embedded in server-rendered HTML -- works on any Next.js 13+ site."
+version = "0.3.5"
+description = "Extract JSON data from Next.js App Router pages: parses React Server Components (RSC) Flight payloads (self.__next_f.push) from server-rendered HTML or raw RSC fetches into clean Python dicts/lists -- for web scraping, crawling, and data extraction with Scrapy, requests, or httpx."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
     { name = "Aly Reda" }
 ]
-keywords = ["nextjs", "scraping", "scrapy", "flight", "rsc", "react-server-components", "web-scraping", "zyte"]
+keywords = [
+    "nextjs", "next.js", "react-server-components", "rsc", "flight",
+    "web-scraping", "webscraping", "scraper", "crawler", "scrapy", "zyte",
+    "html-parser", "json-extraction", "data-extraction", "app-router",
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -22,7 +28,9 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Text Processing :: Markup :: HTML",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 # Stdlib only -- no required runtime dependencies, so it's safe to drop
 # into any Scrapy / Zyte project without touching the rest of your
@@ -46,3 +54,6 @@ nextflight = "nextflight.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nextflight = ["py.typed"]
