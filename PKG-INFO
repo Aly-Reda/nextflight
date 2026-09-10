@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: nextflight
-Version: 0.6.0
+Version: 0.3.2
 Summary: Parse Next.js App Router 'Flight' (__next_f.push) payloads embedded in server-rendered HTML -- works on any Next.js 13+ site.
 Author: Aly Reda
 License: MIT
