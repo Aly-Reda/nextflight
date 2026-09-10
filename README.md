@@ -337,45 +337,6 @@ Two of the Flight row kinds break that assumption:
 holds up on both well-formed and truncated payloads (e.g. from a proxy
 that cuts a response off mid-chunk).
 
-## Building / publishing
-
-### Manual (twine)
-
-```bash
-pip install build twine
-python -m build              # produces dist/*.whl and dist/*.tar.gz
-twine check dist/*           # validate metadata before uploading
-twine upload dist/*          # publish to PyPI (or use --repository testpypi for a dry run)
-```
-
-### Automatic (GitHub Actions + PyPI Trusted Publishing)
-
-This repo ships with `.github/workflows/ci.yml`, which:
-- runs the test suite on every push/PR across Python 3.9–3.12,
-- builds and validates the sdist/wheel,
-- publishes to PyPI automatically whenever a tag like `v0.2.1` is pushed.
-
-Publishing uses PyPI's **Trusted Publisher** flow — no API token stored in
-GitHub secrets. One-time setup:
-
-1. On [pypi.org](https://pypi.org), go to your project → *Publishing* →
-   *Add a new publisher* (or, for a brand-new project name, do this from
-   your PyPI account's "Trusted Publishers" management page before the
-   project exists yet).
-2. Fill in: Owner = your GitHub username/org, Repository = this repo's
-   name, Workflow name = `ci.yml`, Environment name = `pypi`.
-3. In your GitHub repo, go to *Settings → Environments*, create an
-   environment named `pypi` (optionally require a manual approval before
-   deploys, for extra safety).
-4. Release a new version:
-   ```bash
-   # bump version in pyproject.toml and src/nextflight/__init__.py first
-   git commit -am "Release v0.2.2"
-   git tag v0.2.2
-   git push origin main --tags
-   ```
-   The workflow builds, tests, and publishes automatically.
-
 
 ## License
 
