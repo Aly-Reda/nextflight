@@ -14,13 +14,17 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
       - name: Install package + test deps
         run: pip install -e . pytest
+
       - name: Run tests
         run: pytest tests/ -v
 
@@ -28,17 +32,23 @@ jobs:
     name: Build distributions
     needs: test
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install build tooling
         run: pip install build twine
+
       - name: Build sdist + wheel
         run: python -m build
+
       - name: Validate metadata
         run: twine check dist/*
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -47,21 +57,23 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    # Only runs when a version tag like v0.2.1 is pushed -- never on plain
-    # commits to main, so a bad merge can't accidentally publish a release.
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    environment: pypi
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nextflight
+
     permissions:
-      id-token: write  # required for PyPI Trusted Publishing (OIDC)
+      id-token: write
+
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # No username/password/token needed: this authenticates via PyPI's
-        # Trusted Publisher OIDC flow, configured once on pypi.org (see README).
