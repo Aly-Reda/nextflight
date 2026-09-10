@@ -923,3 +923,144 @@ def test_find_all_without_max_results_still_resolves_everything():
     results = page.find_all(lambda n: isinstance(n, dict) and "id" in n)
     assert results == [{"id": 1}, {"id": 2}, {"id": 3}]
     assert set(page._resolved_cache.keys()) == {"0", "1", "2"}
+
+
+# ------------------------------------------------------------------ #
+# $-ref path resolution: React element field names ("props") map to a
+# fixed position in the ["$", type, key, props] wire tuple, not a literal
+# list index -- and path-based refs into a chunk that's still mid-
+# resolution (self-referential sibling nodes within the same chunk) must
+# not be blocked by the circular-reference guard, since they aren't
+# actually circular.
+# ------------------------------------------------------------------ #
+def test_ref_path_resolves_named_props_field_on_element_tuple():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:[[\\"$\\",\\"$L1\\",null,{\\"filters\\":{\\"page\\":2}}],'
+        '[\\"$\\",\\"$L2\\",null,{\\"filters\\":\\"$0:0:props:filters\\"}]]"'
+        '])</script>'
+    )
+    page = extract(html)
+    resolved = page.resolve_chunk("0")
+    assert resolved[1] == ["$", "$L2", None, {"filters": {"page": 2}}]
+
+
+def test_ref_path_self_reference_within_same_chunk_is_not_blocked():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:[{\\"value\\":42},{\\"mirrored\\":\\"$0:0:value\\"}]"'
+        '])</script>'
+    )
+    page = extract(html)
+    resolved = page.resolve_chunk("0")
+    assert resolved[1] == {"mirrored": 42}
+
+
+def test_ref_path_genuine_whole_chunk_cycle_still_returns_none():
+    html = '<script>self.__next_f.push([1, "0:\\"$0\\""])</script>'
+    page = extract(html)
+    assert page.resolve_chunk("0") is None
+
+
+def test_ref_path_props_field_only_applies_to_marker_lists():
+    # A plain 4-element list that does NOT start with the "$" marker
+    # must not be treated as a React element tuple.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:[1,2,3,4]\\n1:\\"$0:props\\""])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_chunk("1") is None
+
+
+def test_ref_path_repeated_self_reference_does_not_loop_forever():
+    # The same self-referential path resolved multiple times (e.g. via
+    # find_all walking the tree) must not blow up or hang -- exercise the
+    # (ref_id, path) guard more than once.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:[{\\"value\\":42},{\\"a\\":\\"$0:0:value\\",\\"b\\":\\"$0:0:value\\"}]"'
+        '])</script>'
+    )
+    page = extract(html)
+    resolved = page.resolve_chunk("0")
+    assert resolved[1] == {"a": 42, "b": 42}
+
+
+# ------------------------------------------------------------------ #
+# Raw RSC-fetch payloads: no HTML, no self.__next_f.push() wrapper --
+# just the Flight row stream directly as the response body. This is what
+# Next.js returns for a request carrying the `RSC: 1` header (client-side
+# navigation fetches; see FlightExtractor.from_rsc_url).
+# ------------------------------------------------------------------ #
+def test_extract_handles_raw_rsc_payload_with_no_html_wrapper():
+    raw = (
+        '1:"$Sreact.fragment"\n'
+        '0:{"a":1}\n'
+        '2:[1,2,3]'
+    )
+    page = extract(raw)
+    assert set(page.keys()) == {"0", "1", "2"}
+    assert page.resolve_chunk("0") == {"a": 1}
+    assert page.resolve_chunk("2") == [1, 2, 3]
+
+
+def test_detect_next_router_recognizes_raw_rsc_payload():
+    from nextflight import detect_next_router
+
+    raw = '1:"$Sreact.fragment"\n0:{"a":1}'
+    assert detect_next_router(raw) == "app"
+
+
+def test_raw_rsc_detection_does_not_misfire_on_plain_text():
+    from nextflight import detect_next_router
+
+    assert detect_next_router("Hello, this is just a sentence.") == "unknown"
+    assert detect_next_router("<html><body>hi</body></html>") == "unknown"
+
+
+def test_raw_rsc_detection_does_not_misfire_on_key_value_or_timestamp_text():
+    # These both match a naive "id:" prefix check on the first line, but
+    # are NOT Flight payloads -- the value after the colon doesn't look
+    # like a genuine Flight row value (a quoted string, array, object,
+    # module/text row, bare ref, or standalone bare number).
+    from nextflight import detect_next_router
+
+    assert detect_next_router("name: John\nage: 30\ncity: NYC") == "unknown"
+    assert detect_next_router("12:34:56 INFO started") == "unknown"
+    assert detect_next_router("C: is the drive letter") == "unknown"
+
+
+def test_raw_rsc_detection_recognizes_every_real_row_shape():
+    # Each of Flight's row value shapes should be recognized as the start
+    # of a genuine raw RSC payload, not just the quoted-string case.
+    from nextflight import detect_next_router
+
+    assert detect_next_router('0:{"a":1}') == "app"
+    assert detect_next_router("0:[1,2,3]") == "app"
+    assert detect_next_router('0:"$Sreact.fragment"') == "app"
+    assert detect_next_router('3:I[897367,["a.js"],"Boundary"]') == "app"
+    assert detect_next_router("17:T5,hello") == "app"
+    assert detect_next_router("5:$3") == "app"
+    assert detect_next_router("0:42") == "app"
+
+
+def test_extract_still_prefers_wrapped_html_over_raw_detection():
+    html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    page = extract(html)
+    assert page.keys() == ["1"]
+
+
+def test_raw_rsc_payload_with_text_rows_and_named_refs():
+    # A more realistic raw RSC payload: a text (T) row plus a $-ref by
+    # name into a React element's props, mirroring a real production
+    # response fetched with the RSC header.
+    raw = (
+        '1:"$Sreact.fragment"\n'
+        '0:[["$","$L1",null,{"filters":{"page":2}}],'
+        '["$","$L2",null,{"filters":"$0:0:props:filters"}]]\n'
+        '5:T5,hello'
+    )
+    page = extract(raw)
+    assert page.resolve_chunk("0")[1][3] == {"filters": {"page": 2}}
+    assert page.resolve_chunk("5") == "hello"

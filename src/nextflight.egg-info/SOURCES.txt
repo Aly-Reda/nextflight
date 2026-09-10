@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+setup.cfg
+src/nextflight/__init__.py
+src/nextflight/cli.py
+src/nextflight/extractor.py
+src/nextflight.egg-info/PKG-INFO
+src/nextflight.egg-info/SOURCES.txt
+src/nextflight.egg-info/dependency_links.txt
+src/nextflight.egg-info/entry_points.txt
+src/nextflight.egg-info/requires.txt
+src/nextflight.egg-info/top_level.txt
+tests/test_extractor.py

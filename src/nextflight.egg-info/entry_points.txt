@@ -1,0 +1,2 @@
+[console_scripts]
+nextflight = nextflight.cli:main

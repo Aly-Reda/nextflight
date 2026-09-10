@@ -102,6 +102,38 @@ production crawling — retries, proxies, JS rendering, robots.txt — fetch
 the page with your own HTTP client / Scrapy / Zyte and pass
 `response.text` to `FlightExtractor(...)` / `extract(...)` instead.)
 
+### Raw RSC fetches (no HTML at all)
+
+Sending a request with an `RSC: 1` header — the way Next.js's own
+client-side navigation does it — gets back the raw Flight row stream
+directly as the response body, with no surrounding HTML and no
+`self.__next_f.push(...)` wrapper. `extract()` detects and parses this
+automatically, exactly the same as the HTML-embedded form:
+
+```python
+from nextflight import FlightExtractor
+
+# Convenience constructor: sets the RSC header for you
+page = FlightExtractor.from_rsc_url("https://example.com/car/search?page=2")
+
+# Or bring your own client (requests, httpx, Scrapy, ...):
+import requests
+resp = requests.get(
+    "https://example.com/car/search",
+    params={"page": "2", "_rsc": "1p28d"},  # build-specific cache key from the page's own JS
+    headers={"RSC": "1", "Next-Url": "/en/car/search"},
+)
+page = FlightExtractor(resp.text)
+```
+
+Some deployments require extra headers to serve the RSC payload instead
+of redirecting to the full HTML page or rejecting the request — a
+matching `Next-Router-State-Tree` header, a `next-url` header pointing at
+the page itself, or a build-specific `_rsc=<id>` query parameter (grab it
+from the page's own client-side JS/network tab; it changes across
+deploys). Copy whatever a real browser sends for that specific site if
+the bare `RSC: 1` header alone doesn't work.
+
 ### Pages Router support
 
 Not every Next.js site uses the App Router. Older / mixed deployments
@@ -197,6 +229,9 @@ page.to_csv("listings.csv", required_keys={"id", "price"})  # works either way
   - `.from_url_async(url, ...)` (async classmethod) — async counterpart to
     `from_url`, for concurrent multi-page crawls with `asyncio.gather(...)`.
     Requires `httpx` (optional).
+  - `.from_rsc_url(url, headers=None, cookies=None, ...)` — fetch a raw RSC
+    payload directly (sets the `RSC: 1` header for you) instead of the full
+    HTML page. See "Raw RSC fetches" above.
   - `page["3f"]` / `.resolve_chunk("3f")` — the resolved JSON for one
     specific chunk id (`page[...]` raises `KeyError` if it doesn't exist;
     `resolve_chunk` returns `None`). `"3f" in page` and `for k in page`

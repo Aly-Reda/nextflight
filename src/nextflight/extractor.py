@@ -122,6 +122,7 @@ class FlightExtractor:
     _ROW_START_RE = re.compile(r"[0-9a-zA-Z_\-]*:")
     _NEXT_ROW_RE = re.compile(r"\n[0-9a-zA-Z_\-]*:")
     _HTML_TAG_RE = re.compile(r"<[a-zA-Z!/][^>\n]{0,300}>")
+    _RAW_RSC_ROW_RE = re.compile(r"^[0-9a-zA-Z_\-]+:")
 
     def __init__(self, html: Any, *, strict: bool = False):
         self.html = _coerce_html(html)
@@ -250,12 +251,50 @@ class FlightExtractor:
             html = resp.text
         return cls(html, strict=strict)
 
+    @classmethod
+    def from_rsc_url(cls, url: str, *, timeout: float = 15.0, headers: Optional[dict] = None,
+                      cookies: Optional[dict] = None, strict: bool = False) -> "FlightExtractor":
+        """Fetch a Next.js App Router page's raw RSC payload directly --
+        a lighter-weight alternative to :meth:`from_url` that skips
+        downloading the full HTML page, the same way Next.js's own
+        client-side navigation does it: with an ``RSC: 1`` request header.
+
+        Uses only the stdlib (no ``requests`` dependency). Pass
+        `headers`/`cookies` to add request headers/cookies your target
+        site needs (session cookies, ``next-url``, etc. -- copy them from
+        a real browser request if the bare ``RSC: 1`` header alone gets
+        rejected or redirected to the full HTML page instead).
+
+        Some deployments also expect a build-specific ``_rsc=<id>`` query
+        parameter or a matching ``next-router-state-tree`` header; those
+        are page- and build-specific, so they aren't set automatically --
+        add them via `headers` / a `?_rsc=...` suffix on `url` if the bare
+        request doesn't return a raw payload (`len(page)` will be 0 if so;
+        check with :func:`detect_next_router` or :meth:`stats`).
+        """
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (nextflight)",
+            "RSC": "1",
+            "Accept": "*/*",
+        }
+        if headers:
+            req_headers.update(headers)
+        if cookies:
+            req_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        req = urllib.request.Request(url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            text = resp.read().decode(charset, errors="replace")
+        return cls(text, strict=strict)
+
     # ------------------------------------------------------------------ #
     # Step 1 -- find every push([...]) call, bracket/quote aware, so it
     # doesn't matter how many <script> tags they're spread across.
     # ------------------------------------------------------------------ #
     def _iter_push_payloads(self) -> Iterator[str]:
+        found_wrapped = False
         for m in self._PUSH_CALL_RE.finditer(self.html):
+            found_wrapped = True
             array_text, _end = self._read_balanced(self.html, m.end(), "[", "]")
             if array_text is None:
                 continue
@@ -267,6 +306,55 @@ class FlightExtractor:
             # want look like push([1, "...rows..."])
             if isinstance(value, list) and len(value) > 1 and isinstance(value[1], str):
                 yield value[1]
+        if not found_wrapped and self._looks_like_raw_rsc_payload(self.html):
+            # Next.js's App Router returns the raw Flight row stream
+            # directly as the response body -- no HTML, no
+            # self.__next_f.push() wrapper -- when a request carries the
+            # RSC fetch header (see FlightExtractor.from_rsc_url). Treat
+            # the whole input as a single payload in that case.
+            yield self.html
+
+    @classmethod
+    def _looks_like_raw_rsc_payload(cls, text: str) -> bool:
+        """Heuristic: does `text` look like a raw Flight row stream on its
+        own, with no surrounding HTML and no `self.__next_f.push(...)`
+        wrapper? That's what an RSC fetch response looks like -- see
+        :meth:`from_rsc_url`.
+
+        Matching just an `id:` prefix on the first line isn't enough --
+        ordinary text like `"name: John"` or a timestamped log line like
+        `"12:34:56 INFO started"` also happens to start that way. The
+        extra check here is that the row *value* right after the colon
+        must itself look like a genuine Flight row value: a quoted
+        string, array, object, module/preload row, text row, bare
+        `$`-ref, or a bare number that is the *entire* rest of the line
+        (not just starts with a digit) -- `"key: value"` fails this
+        because of the space, and `"12:34:56 ..."` fails it because
+        `"34:56 INFO started"` isn't a bare number on its own.
+        """
+        stripped = text.lstrip()
+        if not stripped:
+            return False
+        first_line = stripped.split("\n", 1)[0]
+        m = cls._RAW_RSC_ROW_RE.match(first_line)
+        if not m:
+            return False
+        if "<html" in text[:200].lower():
+            return False
+        rest = first_line[m.end():]
+        if not rest:
+            return False
+        if rest[0] in "\"[{$":
+            return True
+        if rest.startswith("I[") or rest.startswith("HL["):
+            return True
+        if re.match(r"^T[0-9a-fA-F]+,", rest):
+            return True
+        if rest in ("null", "true", "false"):
+            return True
+        if re.match(r"^-?\d+(\.\d+)?$", rest):
+            return True
+        return False
 
     @staticmethod
     def _read_balanced(text: str, start: int, open_ch: str, close_ch: str):
@@ -987,23 +1075,26 @@ def find_next_data(html: Any) -> Optional[dict]:
 def detect_next_router(html: Any) -> str:
     """Best-effort guess at which Next.js router rendered a page:
 
-    - ``"app"`` -- Flight data found (``self.__next_f.push(...)``); use
-      :func:`extract`.
+    - ``"app"`` -- Flight data found, either the usual
+      ``self.__next_f.push(...)`` wrapper embedded in HTML, or a raw RSC
+      fetch response (see :meth:`FlightExtractor.from_rsc_url`); use
+      :func:`extract` either way.
     - ``"pages"`` -- a ``__NEXT_DATA__`` block found; use
       :func:`find_next_data`.
     - ``"both"`` -- both patterns found (rare -- e.g. a Pages Router page
       embedding an App Router island, or a mid-migration site).
-    - ``"unknown"`` -- neither pattern found. Could mean the page isn't
+    - ``"unknown"`` -- none of the above found. Could mean the page isn't
       server-rendered by Next.js at all, or uses a wire format version
       this library doesn't recognize yet.
 
     `html` accepts a raw string/bytes, or a response-like object."""
     html = _coerce_html(html)
     has_flight = bool(FlightExtractor._PUSH_CALL_RE.search(html))
+    has_raw_rsc = (not has_flight) and FlightExtractor._looks_like_raw_rsc_payload(html)
     has_next_data = bool(_NEXT_DATA_RE.search(html))
-    if has_flight and has_next_data:
+    if (has_flight or has_raw_rsc) and has_next_data:
         return "both"
-    if has_flight:
+    if has_flight or has_raw_rsc:
         return "app"
     if has_next_data:
         return "pages"

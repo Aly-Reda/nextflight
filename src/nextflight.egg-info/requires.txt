@@ -1,0 +1,14 @@
+
+[all]
+orjson
+pandas
+httpx
+
+[async]
+httpx
+
+[fast]
+orjson
+
+[pandas]
+pandas
