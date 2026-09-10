@@ -310,3 +310,55 @@ def test_cli_get_and_text(tmp_path):
         capture_output=True, text=True, check=True,
     )
     assert json.loads(result2.stdout) == ["x@y.com"]
+
+
+# ------------------------------------------------------------------ #
+# Regression tests: truncated text-row ("T<hexLen>,<body>") payloads
+# must never raise an uncaught ValueError, matching the module's stated
+# guarantee that it "holds up on both well-formed and truncated payloads".
+# ------------------------------------------------------------------ #
+def test_truncated_text_row_missing_comma_nonstrict():
+    # "1:T1a" -- a text row header cut off before its comma ever arrives.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:T1a"])</script>'
+    )
+    page = extract(html)  # must not raise
+    assert page.keys() == ["0"]
+
+
+def test_truncated_text_row_missing_comma_strict():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:T1a"])</script>'
+    )
+    with pytest.raises(FlightParseError):
+        extract(html, strict=True)
+
+
+def test_truncated_text_row_short_body_nonstrict():
+    # Header promises 0xff bytes but only "short" (5 bytes) actually follow.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:Tff,short"])</script>'
+    )
+    page = extract(html)  # must not raise
+    assert page.resolve_chunk("1") == "short"
+
+
+def test_truncated_text_row_short_body_strict():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:Tff,short"])</script>'
+    )
+    with pytest.raises(FlightParseError):
+        extract(html, strict=True)
+
+
+def test_well_formed_text_row_still_works():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"sections\\":{\\"meta\\":1}}\\n1:T5,hello"])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_all() == {"0": {"sections": {"meta": 1}}, "1": "hello"}

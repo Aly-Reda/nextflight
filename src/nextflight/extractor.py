@@ -233,11 +233,40 @@ class FlightExtractor:
                 # Nothing more to parse.
                 break
             if payload[i] == "T":
-                j = payload.index(",", i + 1)
-                hex_len = int(payload[i + 1:j], 16)
+                comma_idx = payload.find(",", i + 1)
+                if comma_idx == -1:
+                    # Truncated payload: a text row's "T<hexLen>," header
+                    # never got its comma (response cut off mid-header).
+                    if self.strict:
+                        raise FlightParseError(
+                            f"chunk {chunk_id!r}: truncated text-row header "
+                            f"(no comma found): {payload[i:i + 40]!r}"
+                        )
+                    break
+                j = comma_idx
+                try:
+                    hex_len = int(payload[i + 1:j], 16)
+                except ValueError:
+                    if self.strict:
+                        raise FlightParseError(
+                            f"chunk {chunk_id!r}: invalid hex length in text "
+                            f"row: {payload[i + 1:j]!r}"
+                        )
+                    break
                 body_start = j + 1
                 remaining_bytes = payload[body_start:].encode("utf-8")
                 text_bytes = remaining_bytes[:hex_len]
+                if len(text_bytes) < hex_len:
+                    # Truncated payload: fewer bytes remain than the header
+                    # promised (response cut off mid text-row body).
+                    if self.strict:
+                        raise FlightParseError(
+                            f"chunk {chunk_id!r}: text row body truncated "
+                            f"(expected {hex_len} bytes, got {len(text_bytes)})"
+                        )
+                    text_str = text_bytes.decode("utf-8", errors="replace")
+                    yield chunk_id, "text", text_str
+                    break
                 text_str = text_bytes.decode("utf-8")
                 i = body_start + len(text_str)
                 yield chunk_id, "text", text_str
