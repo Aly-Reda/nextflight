@@ -1,3 +1,36 @@
+Metadata-Version: 2.4
+Name: nextflight
+Version: 0.6.0
+Summary: Parse Next.js App Router 'Flight' (__next_f.push) payloads embedded in server-rendered HTML -- works on any Next.js 13+ site.
+Author: Aly Reda
+License: MIT
+Project-URL: Homepage, https://github.com/Aly-Reda/nextflight
+Project-URL: Issues, https://github.com/Aly-Reda/nextflight/issues
+Keywords: nextjs,scraping,scrapy,flight,rsc,react-server-components,web-scraping,zyte
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Internet :: WWW/HTTP :: Indexing/Search
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: fast
+Requires-Dist: orjson; extra == "fast"
+Provides-Extra: pandas
+Requires-Dist: pandas; extra == "pandas"
+Provides-Extra: async
+Requires-Dist: httpx; extra == "async"
+Provides-Extra: all
+Requires-Dist: orjson; extra == "all"
+Requires-Dist: pandas; extra == "all"
+Requires-Dist: httpx; extra == "all"
+Dynamic: license-file
+
 # nextflight
 
 A general-purpose parser for the data Next.js (App Router) embeds in

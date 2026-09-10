@@ -355,6 +355,105 @@ def test_truncated_text_row_short_body_strict():
         extract(html, strict=True)
 
 
+def test_json_keys_and_html_keys_and_text_keys():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"sections\\":[1,2]}\\n'
+        '1:T25,<div class=card><span>hi</span></div>\\n'
+        '2:T5,hello\\n'
+        '3:[1,2,3]"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.json_keys() == ["0", "3"]
+    assert page.text_keys() == ["1", "2"]
+    assert page.html_keys() == ["1"]  # only the one that actually has a tag
+    assert page.kind("0") == "json"
+    assert page.kind("1") == "text"
+    assert page.kind("missing") is None
+
+
+def test_json_keys_html_keys_empty_on_page_with_no_matches():
+    html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    page = extract(html)
+    assert page.json_keys() == ["1"]
+    assert page.html_keys() == []
+    assert page.text_keys() == []
+
+
+def test_stats_includes_row_kind_and_json_html_counts():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:T9,<b>hi</b>"'
+        '])</script>'
+    )
+    page = extract(html)
+    stats = page.stats()
+    assert stats["json_chunk_count"] == 1
+    assert stats["html_chunk_count"] == 1
+    assert stats["flight_row_kind_counts"] == {"json": 1, "text": 1}
+
+
+def test_cli_json_keys_and_html_keys(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text(
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:T9,<b>hi</b>"'
+        '])</script>'
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--json-keys"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout) == ["0"]
+
+    result2 = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--html-keys"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result2.stdout) == ["1"]
+
+
+# ------------------------------------------------------------------ #
+# Performance regression guard: text-row parsing must be roughly linear
+# in payload size, not quadratic. The naive `payload[body_start:].encode()`
+# approach re-encodes the whole remainder of the payload on every text row,
+# which blows up badly on pages with many text rows (translated copy,
+# repeated card fragments, etc). This doesn't assert a hard time bound
+# (too flaky across CI machines) -- it asserts that doubling the number of
+# text rows doesn't roughly quadruple the time, which the O(n^2) bug did.
+# ------------------------------------------------------------------ #
+def test_many_text_rows_scales_roughly_linearly():
+    import time
+
+    def make_html(n_rows, body_len=300):
+        body = "hello world, " * (body_len // 13 + 1)
+        body = body[:body_len]
+        hex_len = format(len(body.encode("utf-8")), "x")
+        rows = [f"{i}:T{hex_len},{body}" for i in range(n_rows)]
+        payload = "\n".join(rows)
+        return f'<script>self.__next_f.push([1, {json.dumps(payload)}])</script>'
+
+    small_html = make_html(300)
+    large_html = make_html(2400)  # 8x the rows
+
+    t0 = time.perf_counter()
+    extract(small_html)
+    small_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    extract(large_html)
+    large_time = time.perf_counter() - t0
+
+    # Linear scaling would give ~8x; quadratic would give ~64x. Allow
+    # generous headroom for noise/overhead but catch a regression back to
+    # quadratic behaviour.
+    assert large_time < small_time * 25, (
+        f"text-row parsing looks quadratic again: {small_time=:.4f}s "
+        f"for 300 rows vs {large_time=:.4f}s for 2400 rows"
+    )
+
+
 def test_well_formed_text_row_still_works():
     html = (
         '<script>self.__next_f.push([1, '
@@ -362,3 +461,465 @@ def test_well_formed_text_row_still_works():
     )
     page = extract(html)
     assert page.resolve_all() == {"0": {"sections": {"meta": 1}}, "1": "hello"}
+
+
+# ------------------------------------------------------------------ #
+# Pages Router support: __NEXT_DATA__ / router detection
+# ------------------------------------------------------------------ #
+def test_find_next_data():
+    from nextflight import find_next_data
+
+    html = (
+        '<script id="__NEXT_DATA__" type="application/json">'
+        '{"props":{"pageProps":{"price":100}},"page":"/x"}'
+        '</script>'
+    )
+    data = find_next_data(html)
+    assert data == {"props": {"pageProps": {"price": 100}}, "page": "/x"}
+
+
+def test_find_next_data_returns_none_when_absent():
+    from nextflight import find_next_data
+
+    app_html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    assert find_next_data(app_html) is None
+    assert find_next_data("<html><body>plain</body></html>") is None
+
+
+def test_find_next_data_returns_none_on_invalid_json():
+    from nextflight import find_next_data
+
+    html = '<script id="__NEXT_DATA__" type="application/json">not json</script>'
+    assert find_next_data(html) is None
+
+
+def test_detect_next_router():
+    from nextflight import detect_next_router
+
+    app_html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    pages_html = (
+        '<script id="__NEXT_DATA__" type="application/json">{"a":1}</script>'
+    )
+    assert detect_next_router(app_html) == "app"
+    assert detect_next_router(pages_html) == "pages"
+    assert detect_next_router(app_html + pages_html) == "both"
+    assert detect_next_router("<html></html>") == "unknown"
+
+
+# ------------------------------------------------------------------ #
+# Query ergonomics: find_any_keys / find_by_key_pattern
+# ------------------------------------------------------------------ #
+def test_find_any_keys():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"1:{\\"cards\\":[{\\"price_usd\\":10},{\\"price_aed\\":40},{\\"other\\":1}]}"'
+        '])</script>'
+    )
+    page = extract(html)
+    matches = page.find_any_keys({"price_usd", "price_aed"})
+    assert len(matches) == 2
+    assert {"price_usd": 10} in matches
+    assert {"price_aed": 40} in matches
+    assert {"other": 1} not in matches
+
+
+def test_find_by_key_pattern():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"1:{\\"cards\\":[{\\"price_usd\\":10},{\\"price_aed\\":40},{\\"other\\":1}]}"'
+        '])</script>'
+    )
+    page = extract(html)
+    matches = page.find_by_key_pattern(r"^price_")
+    assert len(matches) == 2
+
+    import re as _re
+    matches2 = page.find_by_key_pattern(_re.compile(r"^price_"))
+    assert matches2 == matches
+
+
+# ------------------------------------------------------------------ #
+# Provenance tracking: include_source
+# ------------------------------------------------------------------ #
+def test_find_all_include_source():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"id\\":1}\\n1:{\\"id\\":2}"'
+        '])</script>'
+    )
+    page = extract(html)
+    results = page.find_all(
+        lambda n: isinstance(n, dict) and "id" in n, include_source=True
+    )
+    assert results == [({"id": 1}, "0"), ({"id": 2}, "1")]
+
+    # default (no include_source) is unchanged: bare nodes
+    plain = page.find_all(lambda n: isinstance(n, dict) and "id" in n)
+    assert plain == [{"id": 1}, {"id": 2}]
+
+
+def test_find_by_keys_include_source():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"sections\\":[1,2],\\"meta\\":{}}"'
+        '])</script>'
+    )
+    page = extract(html)
+    result = page.find_by_keys({"sections", "meta"}, include_source=True)
+    assert result == ({"sections": [1, 2], "meta": {}}, "0")
+
+
+def test_find_all_by_keys_include_source():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"id\\":1,\\"price\\":5}\\n1:{\\"id\\":2,\\"price\\":6}"'
+        '])</script>'
+    )
+    page = extract(html)
+    results = page.find_all_by_keys({"id", "price"}, include_source=True)
+    assert results == [
+        ({"id": 1, "price": 5}, "0"),
+        ({"id": 2, "price": 6}, "1"),
+    ]
+
+
+def test_include_source_with_custom_root_is_none():
+    html = '<script>self.__next_f.push([1, "1:{\\"id\\":1}"])</script>'
+    page = extract(html)
+    root = page.resolve_chunk("1")
+    result = page.find_all(lambda n: isinstance(n, dict) and "id" in n,
+                            root=root, include_source=True)
+    assert result == [({"id": 1}, None)]
+
+
+# ------------------------------------------------------------------ #
+# shape() / .stats() tree summary
+# ------------------------------------------------------------------ #
+def test_shape_summarizes_structure_not_values():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"1:{\\"a\\":{\\"b\\":[1,2,3]},\\"c\\":\\"hi\\"}"'
+        '])</script>'
+    )
+    page = extract(html)
+    shape = page.shape()
+    assert shape == {"1": {"a": {"b": ["int"]}, "c": "str"}}
+
+    # single chunk
+    assert page.shape("1") == {"a": {"b": ["int"]}, "c": "str"}
+
+
+def test_shape_max_depth_collapses_deep_branches():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"1:{\\"a\\":{\\"b\\":{\\"c\\":{\\"d\\":1}}}}"'
+        '])</script>'
+    )
+    page = extract(html)
+    shallow = page.shape("1", max_depth=1)
+    assert shallow == {"a": "dict"}
+
+
+def test_shape_handles_empty_list():
+    html = '<script>self.__next_f.push([1, "1:{\\"items\\":[]}"])</script>'
+    page = extract(html)
+    assert page.shape("1") == {"items": []}
+
+
+# ------------------------------------------------------------------ #
+# diff_pages / page.diff
+# ------------------------------------------------------------------ #
+def test_diff_pages_detects_added_removed_changed():
+    from nextflight import diff_pages
+
+    old_html = '<script>self.__next_f.push([1, "1:{\\"price\\":100,\\"stock\\":5}"])</script>'
+    new_html = (
+        '<script>self.__next_f.push([1, '
+        '"1:{\\"price\\":90,\\"promo\\":true}"'
+        '])</script>'
+    )
+    old_page = extract(old_html)
+    new_page = extract(new_html)
+
+    d = diff_pages(old_page, new_page)
+    assert d["changed"] == {"1.price": (100, 90)}
+    assert d["added"] == {"1.promo": True}
+    assert d["removed"] == {"1.stock": 5}
+
+
+def test_diff_pages_no_changes_when_identical():
+    from nextflight import diff_pages
+
+    html = '<script>self.__next_f.push([1, "1:{\\"price\\":100}"])</script>'
+    page_a = extract(html)
+    page_b = extract(html)
+    d = diff_pages(page_a, page_b)
+    assert d == {"added": {}, "removed": {}, "changed": {}}
+
+
+def test_page_diff_method_matches_diff_pages_function():
+    from nextflight import diff_pages
+
+    old_html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    new_html = '<script>self.__next_f.push([1, "1:{\\"a\\":2}"])</script>'
+    old_page = extract(old_html)
+    new_page = extract(new_html)
+    assert old_page.diff(new_page) == diff_pages(old_page, new_page)
+
+
+# ------------------------------------------------------------------ #
+# iter_resolved
+# ------------------------------------------------------------------ #
+def test_iter_resolved_matches_resolve_all():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:{\\"b\\":2}"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert dict(page.iter_resolved()) == page.resolve_all()
+
+
+def test_iter_resolved_is_lazy_generator():
+    import types
+
+    html = '<script>self.__next_f.push([1, "0:{\\"a\\":1}\\n1:{\\"b\\":2}"])</script>'
+    page = extract(html)
+    gen = page.iter_resolved()
+    assert isinstance(gen, types.GeneratorType)
+    first = next(gen)
+    assert first == ("0", {"a": 1})
+
+
+# ------------------------------------------------------------------ #
+# to_dataframe / to_csv
+# ------------------------------------------------------------------ #
+def test_to_dataframe_requires_records_or_required_keys():
+    html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    page = extract(html)
+    with pytest.raises(ValueError):
+        page.to_dataframe()
+
+
+def test_to_dataframe_from_required_keys():
+    pd = pytest.importorskip("pandas")
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"1:{\\"cards\\":[{\\"id\\":1,\\"price\\":10},{\\"id\\":2,\\"price\\":20}]}"'
+        '])</script>'
+    )
+    page = extract(html)
+    df = page.to_dataframe(required_keys={"id", "price"})
+    assert list(df["id"]) == [1, 2]
+    assert list(df["price"]) == [10, 20]
+
+
+def test_to_dataframe_from_explicit_records():
+    pytest.importorskip("pandas")
+    html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    page = extract(html)
+    df = page.to_dataframe(records=[{"x": 1}, {"x": 2}])
+    assert list(df["x"]) == [1, 2]
+
+
+def test_to_csv_falls_back_to_stdlib_without_pandas(tmp_path, monkeypatch):
+    import builtins
+
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"1:{\\"cards\\":[{\\"id\\":1,\\"price\\":10}]}"'
+        '])</script>'
+    )
+    page = extract(html)
+    out_path = tmp_path / "out.csv"
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "pandas":
+            raise ImportError("blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    page.to_csv(str(out_path), required_keys={"id", "price"})
+    content = out_path.read_text()
+    assert "id" in content and "price" in content
+    assert "1" in content and "10" in content
+
+
+def test_to_csv_empty_records_writes_essentially_empty_file(tmp_path):
+    html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    page = extract(html)
+    out_path = tmp_path / "empty.csv"
+    page.to_csv(str(out_path), records=[])
+    # With pandas installed, an empty DataFrame's to_csv writes just a
+    # blank line; without pandas, the stdlib fallback writes nothing at
+    # all. Either is fine -- no data rows, no crash.
+    assert out_path.read_text().strip() == ""
+
+
+# ------------------------------------------------------------------ #
+# CLI: --router, --next-data, --tree, --any-keys, --redact
+# ------------------------------------------------------------------ #
+def test_cli_router(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text('<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>')
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--router"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout) == "app"
+
+
+def test_cli_next_data(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text(
+        '<script id="__NEXT_DATA__" type="application/json">{"props":{"a":1}}</script>'
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--next-data"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout) == {"props": {"a": 1}}
+
+
+def test_cli_next_data_missing_errors(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text('<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>')
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--next-data"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 1
+    assert "No __NEXT_DATA__" in result.stderr
+
+
+def test_cli_tree(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text(
+        '<script>self.__next_f.push([1, "1:{\\"a\\":{\\"b\\":1}}"])</script>'
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--tree"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout) == {"1": {"a": {"b": "int"}}}
+
+
+def test_cli_any_keys(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text(
+        '<script>self.__next_f.push([1, "1:{\\"a\\":1,\\"b\\":2}"])</script>'
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--any-keys", "a,z"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout) == [{"a": 1, "b": 2}]
+
+
+def test_cli_redact(tmp_path):
+    html_file = tmp_path / "page.html"
+    html_file.write_text(
+        '<script id="__NEXT_DATA__" type="application/json">'
+        '{"email":"sales@example.com"}</script>'
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "nextflight.cli", str(html_file), "--next-data", "--redact"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "sales@example.com" not in result.stdout
+    assert "[REDACTED_EMAIL]" in result.stdout
+
+
+# ------------------------------------------------------------------ #
+# resolve_json / resolve_html / resolve_text
+# ------------------------------------------------------------------ #
+def test_resolve_json_html_text_partition_the_page():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"a\\":1}\\n1:T9,<b>hi</b>\\n2:T5,hello\\n3:[1,2,3]"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_json() == {"0": {"a": 1}, "3": [1, 2, 3]}
+    assert page.resolve_html() == {"1": "<b>hi</b>"}
+    assert page.resolve_text() == {"1": "<b>hi</b>", "2": "hello"}
+    # resolve_text is a superset of resolve_html; resolve_json + resolve_text
+    # together account for every chunk on this page (no overlap here).
+    combined = {**page.resolve_json(), **page.resolve_text()}
+    assert combined == page.resolve_all()
+
+
+def test_resolve_json_follows_refs_into_text_chunks():
+    # A JSON chunk can reference a text chunk via a `$`-ref; resolve_json()
+    # should still fully dereference that, even though the referenced
+    # chunk itself is text-typed and wouldn't show up in resolve_json()'s
+    # own top-level key list.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"label\\":\\"$1\\"}\\n1:T5,hello"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.json_keys() == ["0"]
+    assert page.resolve_json() == {"0": {"label": "hello"}}
+
+
+def test_resolve_html_and_text_empty_when_no_such_rows():
+    html = '<script>self.__next_f.push([1, "1:{\\"a\\":1}"])</script>'
+    page = extract(html)
+    assert page.resolve_html() == {}
+    assert page.resolve_text() == {}
+    assert page.resolve_json() == {"1": {"a": 1}}
+
+
+# ------------------------------------------------------------------ #
+# find_one / find_by_keys stop RESOLVING early, not just searching early
+# ------------------------------------------------------------------ #
+def test_find_one_does_not_resolve_chunks_past_the_match():
+    # Build a page where chunk "0" matches immediately and chunk "1" would
+    # raise if it were ever resolved (it isn't valid $-ref syntax the
+    # resolver would choke on, but we detect "was it touched at all" via
+    # the resolve cache instead of relying on an exception).
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"id\\":1}\\n1:{\\"id\\":2}\\n2:{\\"id\\":3}"'
+        '])</script>'
+    )
+    page = extract(html)
+    result = page.find_one(lambda n: isinstance(n, dict) and n.get("id") == 1)
+    assert result == {"id": 1}
+    # Only chunk "0" should have been resolved (and cached) -- "1" and "2"
+    # were never reached because find_one stopped at the first match.
+    assert "0" in page._resolved_cache
+    assert "1" not in page._resolved_cache
+    assert "2" not in page._resolved_cache
+
+
+def test_find_all_with_max_results_stops_resolving_early():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"id\\":1}\\n1:{\\"id\\":2}\\n2:{\\"id\\":3}\\n3:{\\"id\\":4}"'
+        '])</script>'
+    )
+    page = extract(html)
+    results = page.find_all(lambda n: isinstance(n, dict) and "id" in n, max_results=2)
+    assert results == [{"id": 1}, {"id": 2}]
+    assert "0" in page._resolved_cache and "1" in page._resolved_cache
+    assert "2" not in page._resolved_cache
+    assert "3" not in page._resolved_cache
+
+
+def test_find_all_without_max_results_still_resolves_everything():
+    # Sanity check the early-exit optimization doesn't accidentally skip
+    # chunks when there's no max_results to stop at.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"0:{\\"id\\":1}\\n1:{\\"id\\":2}\\n2:{\\"id\\":3}"'
+        '])</script>'
+    )
+    page = extract(html)
+    results = page.find_all(lambda n: isinstance(n, dict) and "id" in n)
+    assert results == [{"id": 1}, {"id": 2}, {"id": 3}]
+    assert set(page._resolved_cache.keys()) == {"0", "1", "2"}

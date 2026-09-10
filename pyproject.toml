@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nextflight"
-version = "0.3.1"
+version = "0.3.2"
 description = "Parse Next.js App Router 'Flight' (__next_f.push) payloads embedded in server-rendered HTML -- works on any Next.js 13+ site."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,9 +24,18 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-# Stdlib only -- no runtime dependencies, so it's safe to drop into any
-# Scrapy / Zyte project without touching the rest of your dependency tree.
+# Stdlib only -- no required runtime dependencies, so it's safe to drop
+# into any Scrapy / Zyte project without touching the rest of your
+# dependency tree. orjson/pandas/httpx are used automatically if already
+# installed (faster JSON decoding, to_dataframe()/to_csv(), from_url_async()
+# respectively), but nothing here is required to import or use the package.
 dependencies = []
+
+[project.optional-dependencies]
+fast = ["orjson"]
+pandas = ["pandas"]
+async = ["httpx"]
+all = ["orjson", "pandas", "httpx"]
 
 [project.urls]
 Homepage = "https://github.com/Aly-Reda/nextflight"

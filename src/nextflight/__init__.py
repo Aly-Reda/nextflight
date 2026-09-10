@@ -19,6 +19,9 @@ from .extractor import (
     FlightParseError,
     extract,
     find_json_ld,
+    find_next_data,
+    detect_next_router,
+    diff_pages,
 )
 
 __all__ = [
@@ -26,11 +29,14 @@ __all__ = [
     "FlightParseError",
     "extract",
     "find_json_ld",
+    "find_next_data",
+    "detect_next_router",
+    "diff_pages",
     "NextFlightExtractor",  # deprecated alias, see below
     "extract_json_ld",      # deprecated alias, see below
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.6.0"
 
 
 # ---------------------------------------------------------------------- #
