@@ -58,9 +58,9 @@ from typing import Any, Callable, Iterable, Iterator, Optional, Union
 # shapes Flight payloads produce. Falls back to stdlib json with zero
 # required dependencies either way.
 try:
-    import orjson as _orjson  # type: ignore
+    import orjson as _orjson  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - exercised via the stdlib fallback path
-    _orjson = None
+    _orjson = None  # type: ignore[assignment]
 
 if _orjson is not None:  # pragma: no cover - depends on optional dependency
     _JSON_ERRORS: tuple = (json.JSONDecodeError, _orjson.JSONDecodeError)

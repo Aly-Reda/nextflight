@@ -23,6 +23,7 @@ from nextflight.scrapy_middleware import (  # noqa: E402
     FlightItemPipeline,
     NextflightSpiderMixin,
     _fallback_cache,
+    _flight_property,
 )
 
 
@@ -117,24 +118,36 @@ def test_most_recently_constructed_middleware_settings_win():
 def test_fallback_cache_entries_are_garbage_collected():
     # Regression: the fallback cache used to be a plain dict keyed by
     # id(response), which never shrank and risked an id-reuse collision.
-    # This forces the fallback path (a Response subclass that rejects
-    # instance attribute assignment) and verifies the WeakKeyDictionary
-    # actually drops the entry once the response itself is collected.
-    class LockedResponse(HtmlResponse):
-        __slots__ = ()
+    #
+    # NOTE on how this forces the fallback path: `_flight_property` tries
+    # `object.__setattr__(self, ...)` directly -- which calls straight
+    # into the base `object` implementation and does NOT go through a
+    # subclass's own overridden `__setattr__` at all. So a
+    # `class LockedResponse(HtmlResponse): def __setattr__(...): raise
+    # ...` trick (an earlier version of this test) never actually forced
+    # anything; whether the primary path succeeds instead depends
+    # entirely on whether the installed Scrapy version's own `Response`
+    # class happens to lack a `__dict__` slot for arbitrary attributes --
+    # which varies across Scrapy versions/Python versions and made this
+    # test flaky in CI's version matrix. A minimal object we define from
+    # scratch, with an explicit `__slots__` and no inherited `__dict__`,
+    # makes `object.__setattr__` genuinely and portably fail for any
+    # attribute name not in `__slots__`, on every Python/Scrapy version.
+    class LockedFakeResponse:
+        __slots__ = ("body", "url", "__weakref__")
 
-        def __setattr__(self, name, value):
-            if name == "_nextflight_cache":
-                raise AttributeError("locked")
-            super().__setattr__(name, value)
+        def __init__(self, url, body):
+            self.url = url
+            self.body = body
 
     FlightMiddleware()
-    resp = LockedResponse(url="https://example.com", body=_push_html('0:{"a":1}'))
-    _ = resp.flight  # forces the fallback path
+    resp = LockedFakeResponse(url="https://example.com", body=_push_html('0:{"a":1}'))
+    flight = _flight_property(resp)  # forces the fallback path
+    assert flight.resolve_chunk("0") == {"a": 1}
     assert len(_fallback_cache) >= 1
 
     resp_id = id(resp)
-    del resp
+    del resp, flight
     gc.collect()
     # The entry keyed on the now-collected response must be gone -- not
     # just eventually, but immediately after collection, since that's
@@ -334,17 +347,24 @@ def test_concurrent_access_does_not_corrupt_fallback_cache():
     # hammering the same fallback cache simultaneously, to catch any
     # accidental shared-mutable-state bug the reactor's cooperative
     # scheduling would otherwise never surface.
-    class LockedResponse(HtmlResponse):
-        __slots__ = ()
+    #
+    # Uses a minimal, portably-slotted fake object and calls
+    # `_flight_property` directly (rather than a `Response` subclass's
+    # `.flight` property) for the same reason as
+    # `test_fallback_cache_entries_are_garbage_collected` above:
+    # `object.__setattr__` bypasses any subclass's own `__setattr__`
+    # override, so whether a `Response` subclass actually forces the
+    # fallback path is Scrapy-version-dependent, not something a
+    # `__setattr__` override can reliably control.
+    class LockedFakeResponse:
+        __slots__ = ("body", "url", "__weakref__")
 
-        def __setattr__(self, name, value):
-            if name == "_nextflight_cache":
-                raise AttributeError("locked")
-            super().__setattr__(name, value)
+        def __init__(self, url, body):
+            self.url = url
+            self.body = body
 
-    FlightMiddleware()
     responses = [
-        LockedResponse(url=f"https://example.com/{i}", body=_push_html(f'0:{{"id":{i}}}'))
+        LockedFakeResponse(url=f"https://example.com/{i}", body=_push_html(f'0:{{"id":{i}}}'))
         for i in range(50)
     ]
     errors = []
@@ -352,7 +372,7 @@ def test_concurrent_access_does_not_corrupt_fallback_cache():
     def worker(resp, idx):
         try:
             for _ in range(20):
-                page = resp.flight
+                page = _flight_property(resp)
                 assert page.resolve_chunk("0") == {"id": idx}
         except Exception as e:  # pragma: no cover - failure path
             errors.append(e)
@@ -367,3 +387,8 @@ def test_concurrent_access_does_not_corrupt_fallback_cache():
         t.join()
 
     assert not errors
+    # All 50 responses should have gone through the fallback path (none
+    # of them can hold a `_nextflight_cache` attribute at all), so this
+    # is also a real check that concurrent fallback-cache access across
+    # threads didn't corrupt or lose entries.
+    assert len(_fallback_cache) >= 50
