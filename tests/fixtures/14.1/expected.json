@@ -1,0 +1,64 @@
+{
+  "keys": [
+    "0",
+    "5",
+    "6"
+  ],
+  "resolve_all": {
+    "0": [
+      "$",
+      "div",
+      null,
+      {
+        "children": [
+          "$",
+          "section",
+          null,
+          {
+            "children": {
+              "price": 3999,
+              "reviews": [
+                {
+                  "author": "A. Reviewer",
+                  "rating": 5
+                }
+              ],
+              "title": "Product C"
+            }
+          }
+        ]
+      }
+    ],
+    "5": {
+      "price": 3999,
+      "reviews": [
+        {
+          "author": "A. Reviewer",
+          "rating": 5
+        }
+      ],
+      "title": "Product C"
+    },
+    "6": {
+      "author": "A. Reviewer",
+      "rating": 5
+    }
+  },
+  "stats": {
+    "chunk_count": 3,
+    "chunk_ids": [
+      "0",
+      "5",
+      "6"
+    ],
+    "flight_row_kind_counts": {
+      "json": 3
+    },
+    "html_chunk_count": 0,
+    "json_chunk_count": 3,
+    "value_type_counts": {
+      "dict": 2,
+      "list": 1
+    }
+  }
+}

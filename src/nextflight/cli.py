@@ -15,6 +15,7 @@ import json
 import re
 import sys
 import time
+from typing import Any
 
 from .extractor import FlightExtractor, detect_next_router, diff_pages, find_next_data
 
@@ -150,17 +151,18 @@ def main(argv=None) -> int:
         return 0
 
     if args.next_data:
-        result = find_next_data(html)
-        if result is None:
+        next_data_result = find_next_data(html)
+        if next_data_result is None:
             sys.stderr.write(
                 "No __NEXT_DATA__ block found -- this may be an App Router "
                 "page instead (try without --next-data, or check --router).\n"
             )
             return 1
-        _write_output(result, args)
+        _write_output(next_data_result, args)
         return 0
 
     extractor = FlightExtractor(html)
+    result: Any
 
     if args.keys:
         keys = {k.strip() for k in args.keys.split(",") if k.strip()}

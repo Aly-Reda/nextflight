@@ -1,0 +1,47 @@
+{
+  "keys": [
+    "0",
+    "1",
+    "2"
+  ],
+  "resolve_all": {
+    "0": [
+      "$",
+      "div",
+      null,
+      {
+        "children": [
+          "$",
+          "h1",
+          null,
+          {
+            "children": "Hello World"
+          }
+        ]
+      }
+    ],
+    "1": "Hello World",
+    "2": {
+      "price": 1999,
+      "title": "Product A"
+    }
+  },
+  "stats": {
+    "chunk_count": 3,
+    "chunk_ids": [
+      "0",
+      "1",
+      "2"
+    ],
+    "flight_row_kind_counts": {
+      "json": 3
+    },
+    "html_chunk_count": 0,
+    "json_chunk_count": 2,
+    "value_type_counts": {
+      "dict": 1,
+      "list": 1,
+      "str": 1
+    }
+  }
+}

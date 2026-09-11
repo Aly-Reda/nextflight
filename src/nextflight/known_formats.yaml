@@ -1,0 +1,51 @@
+# nextflight known_formats registry
+#
+# Maps Next.js version ranges to known Flight wire-format quirks/changes.
+# This is a best-effort, community-maintained reference -- Next.js does not
+# document or version this wire format itself, so entries here are inferred
+# from observed payloads. Consumed internally by
+# `FlightExtractor.next_version_hint()`; also intended as a citable
+# reference for other tooling authors parsing the same format.
+#
+# Each entry:
+#   range:   inclusive Next.js version range this applies to (informal)
+#   markers: substrings/patterns whose presence increases confidence a
+#            payload belongs to this range (used heuristically, not as
+#            strict version detection -- Next.js gives no explicit
+#            version marker in the payload itself)
+#   notes:   human-readable description of what's different in this range
+
+- range: "13.0 - 13.3"
+  markers:
+    - "self.__next_f.push"
+  notes: >
+    Earliest App Router Flight format. Row prefixes and $-ref sigils as
+    implemented in this library's default parser. No HL (preload) rows
+    observed in early builds.
+
+- range: "13.4 - 14.0"
+  markers:
+    - "self.__next_f.push"
+    - ":HL["
+  notes: >
+    Introduction of HL preload rows for font/stylesheet hints, often with
+    an empty chunk id shared across many rows on the same page.
+
+- range: "14.1 - 14.2"
+  markers:
+    - "$@"
+  notes: >
+    Wider use of "$@<id>" Suspense placeholder markers for streamed,
+    below-the-fold content sections.
+
+- range: "15.0+"
+  markers:
+    - "$Sreact.fragment"
+    - "$Sreact.suspense"
+  notes: >
+    Additional well-known "$S<name>" symbol references seen for built-in
+    React symbols (Fragment, Suspense) rather than only user components.
+
+# Add new entries here as Next.js releases change the format. See the
+# "Documentation & trust signals" section of the project docs for the
+# same-week patch release policy this registry supports.

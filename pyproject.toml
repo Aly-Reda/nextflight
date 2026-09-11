@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nextflight"
-version = "0.3.5"
+version = "0.4.0"
 description = "Extract JSON data from Next.js App Router pages: parses React Server Components (RSC) Flight payloads (self.__next_f.push) from server-rendered HTML or raw RSC fetches into clean Python dicts/lists -- for web scraping, crawling, and data extraction with Scrapy, requests, or httpx."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -43,7 +43,9 @@ dependencies = []
 fast = ["orjson"]
 pandas = ["pandas"]
 async = ["httpx"]
-all = ["orjson", "pandas", "httpx"]
+schema = ["pydantic>=2"]
+scrapy = ["scrapy"]
+all = ["orjson", "pandas", "httpx", "pydantic>=2", "scrapy"]
 
 [project.urls]
 Homepage = "https://github.com/Aly-Reda/nextflight"
@@ -56,4 +58,4 @@ nextflight = "nextflight.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-nextflight = ["py.typed"]
+nextflight = ["py.typed", "known_formats.yaml"]

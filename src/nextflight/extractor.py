@@ -49,7 +49,8 @@ import re
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from typing import Any, Callable, Iterable, Iterator, Optional
+from inspect import iscoroutinefunction as _is_coroutine_function
+from typing import Any, Callable, Iterable, Iterator, Optional, Union
 
 # Optional accelerator: if the caller already has orjson installed (common
 # in scraping stacks), use it for JSON decoding -- it's a drop-in replacement
@@ -71,6 +72,187 @@ else:
 
     def _json_loads(s: str) -> Any:
         return json.loads(s)
+
+
+# A single, shared, stateless `json.JSONDecoder` used specifically for
+# `raw_decode(text, idx)` in `_split_rows`'s bracket branches -- this is
+# NOT the same thing as `_json_loads` above (which may be orjson) and is
+# intentionally always the stdlib decoder: `raw_decode` both (a) finds
+# where a JSON object/array ends starting at a given index and (b)
+# decodes it, in a single C-accelerated pass, whereas the previous
+# implementation walked the bracket/quote structure by hand in pure
+# Python (`_read_balanced`) just to find the end index. Profiling a
+# ~500KB synthetic page showed `_read_balanced`'s hand-rolled scan
+# consuming roughly 40% of total parse+resolve time -- by far the single
+# largest hot spot -- so replacing that Python-level scan with this
+# C-accelerated one is a straightforward win (~25-35% faster end to end
+# on synthetic small/medium/large pages -- see benchmarks/). The decoded
+# value this produces is discarded (not cached) for non-strict
+# construction, to preserve the existing lazy-materialization contract
+# (see `_extract_all`); `strict=True` construction, which was already
+# eagerly materializing every chunk, does reuse it to skip a redundant
+# second decode. `raw_decode` is safe to share across calls/instances: a
+# `JSONDecoder` with default settings holds no per-call state.
+#
+# `_read_balanced` is NOT removed -- it remains the fallback for
+# malformed/truncated input (where `raw_decode` raises), preserving the
+# exact existing `strict=False`/`repair=True` tolerance behavior for
+# those cases unchanged. See `_fast_bracket_decode`.
+_BRACKET_DECODER = json.JSONDecoder()
+
+
+def _json_dumps(value: Any, *, indent: Optional[int] = None) -> str:
+    """Encode-side counterpart to `_json_loads`: uses `orjson.dumps` when
+    available (still falling back to the stdlib `json.dumps` either when
+    orjson isn't installed, or for the indented case -- orjson's own
+    indent option only supports a fixed 2-space indent via `OPT_INDENT_2`,
+    so a caller-specified `indent` other than 2 falls back to stdlib to
+    honor it exactly). Used by `.to_json()` and the CLI's output writer --
+    not on the hot per-row parsing path, but a large `.to_json()` export
+    benefits the same way decoding does. Does NOT sort keys (matches the
+    pre-existing `json.dumps(..., indent=2)` behavior these call sites
+    used directly before) -- callers that need deterministic key order
+    for comparison/fingerprinting (e.g. `find_all_by_keys(dedupe=True)`)
+    call `json.dumps(..., sort_keys=True)` directly instead of through
+    this helper, since orjson's key-sorting option and stdlib's aren't
+    quite the same feature to unify here."""
+    if _orjson is not None and (indent is None or indent == 2):
+        options = _orjson.OPT_INDENT_2 if indent == 2 else 0
+        return _orjson.dumps(value, option=options, default=str).decode("utf-8")
+    return json.dumps(value, indent=indent, ensure_ascii=False, default=str)
+
+
+def _json_dumps_sorted(value: Any) -> str:
+    """Deterministic (key-order-independent) string encoding of `value`,
+    used for `find_all_by_keys(dedupe=True)`'s fingerprinting -- two
+    dicts with the same keys/values in a different order must fingerprint
+    identically, or dedupe would miss exact duplicates that merely got
+    serialized in a different field order elsewhere in the payload.
+    Prefers `orjson.OPT_SORT_KEYS` (recursive key sorting, natively
+    faster than stdlib's) when available."""
+    if _orjson is not None:
+        return _orjson.dumps(value, option=_orjson.OPT_SORT_KEYS, default=str).decode("utf-8")
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _fast_bracket_decode(payload: str, start: int) -> tuple:
+    """Attempt to decode the JSON object/array starting exactly at
+    `payload[start]` (which must be `'{'` or `'['`) in one pass. Returns
+    `(raw_substring, end_index, decoded_value)` on success, or `(None,
+    start, None)` if the JSON at `start` is malformed or the payload is
+    truncated mid-value -- callers fall back to `_read_balanced` in that
+    case, which tolerates truncation the way `raw_decode` does not."""
+    try:
+        value, end = _BRACKET_DECODER.raw_decode(payload, start)
+    except ValueError:
+        return None, start, None
+    return payload[start:end], end, value
+
+
+_KNOWN_FORMATS_CACHE: Optional[list] = None
+
+
+def _load_known_formats() -> list:
+    """Load the bundled ``known_formats.yaml`` registry (see that file),
+    used by :meth:`FlightExtractor.next_version_hint`. Uses `pyyaml` if
+    it's already installed (common in scraping stacks); otherwise falls
+    back to a small hand-rolled parser sufficient for this file's own
+    fixed, simple structure (a top-level list of ``range``/``markers``/
+    ``notes`` entries) -- kept dependency-free by design, same as the
+    rest of the core library. Result is cached after the first call."""
+    global _KNOWN_FORMATS_CACHE
+    if _KNOWN_FORMATS_CACHE is not None:
+        return _KNOWN_FORMATS_CACHE
+    import os
+    path = os.path.join(os.path.dirname(__file__), "known_formats.yaml")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        _KNOWN_FORMATS_CACHE = []
+        return _KNOWN_FORMATS_CACHE
+    try:
+        import yaml  # type: ignore
+        _KNOWN_FORMATS_CACHE = yaml.safe_load(text) or []
+    except ImportError:
+        _KNOWN_FORMATS_CACHE = _parse_simple_yaml_list(text)
+    return _KNOWN_FORMATS_CACHE
+
+
+def _parse_simple_yaml_list(text: str) -> list:
+    """Minimal parser for this package's own `known_formats.yaml` shape
+    only -- NOT a general YAML parser. Handles: top-level `- key: value`
+    list items, nested `key: >` folded scalars, and nested `- item`
+    sub-lists (used for `markers`, whose values may themselves contain
+    colons, e.g. `- ":HL["` -- those must NOT be parsed as a nested
+    `key: value` pair). Good enough to avoid a hard `pyyaml` dependency
+    for a file this project fully controls the shape of."""
+    entries: list = []
+    current: Optional[dict] = None
+    current_list_key: Optional[str] = None
+    current_list_indent: Optional[int] = None
+    folded_key: Optional[str] = None
+    folded_lines: list = []
+
+    def flush_folded() -> None:
+        nonlocal folded_key, folded_lines
+        if current is not None and folded_key:
+            current[folded_key] = " ".join(line.strip() for line in folded_lines if line.strip())
+        folded_key = None
+        folded_lines = []
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.strip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        stripped = raw_line.strip()
+        if folded_key and indent > 2:
+            folded_lines.append(stripped)
+            continue
+        flush_folded()
+
+        is_top_level_entry = stripped.startswith("- ") and indent == 0
+        is_nested_list_item = (
+            stripped.startswith("- ")
+            and current_list_key is not None
+            and not is_top_level_entry
+            and (current_list_indent is None or indent >= current_list_indent)
+        )
+
+        if is_top_level_entry:
+            current = {}
+            entries.append(current)
+            stripped = stripped[2:]
+            current_list_key = None
+            current_list_indent = None
+        elif is_nested_list_item:
+            # A `- <value>` line under an already-open `key:` list --
+            # the value may itself contain a colon (e.g. a marker like
+            # ":HL["), so this branch must run BEFORE any generic
+            # colon-splitting below, not after.
+            if current is not None and current_list_key is not None:
+                current[current_list_key].append(stripped[2:].strip().strip('"'))
+            continue
+
+        if current is None:
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if val == ">":
+                folded_key = key
+                folded_lines = []
+                current_list_key = None
+            elif val == "":
+                current[key] = []
+                current_list_key = key
+                current_list_indent = indent + 1
+            else:
+                current[key] = val.strip('"')
+                current_list_key = None
+    flush_folded()
+    return entries
 
 
 class FlightParseError(Exception):
@@ -195,6 +377,18 @@ class FlightExtractor:
         valid JSON and doesn't look like a bare `$`-reference marker.
         Default False: such rows are kept as raw strings so a handful of
         odd rows never take down extraction of everything else on the page.
+    repair:
+        If True, additionally attempt to heuristically recover chunks
+        whose JSON body fails to decode outright (as opposed to merely
+        being an unrecognized bare marker) -- e.g. a proxy/CDN that cut
+        the response short mid-object. This closes unbalanced brackets
+        and quotes and retries the decode; chunks that still can't be
+        salvaged fall back to the same raw-string behavior as
+        `strict=False`. Mutually exclusive with `strict=True` (repairing
+        implies tolerating malformed input, which is what `strict` exists
+        to forbid); combining both raises `ValueError`. Has no effect on
+        already-well-formed payloads. See :meth:`parse_confidence` to
+        check how much of a repaired page was actually salvaged.
     """
 
     _REF_RE = re.compile(r"^\$(?P<sigil>[A-Z@]{0,2})(?P<id>[^:\s]+)(?::(?P<path>.+))?$")
@@ -204,9 +398,29 @@ class FlightExtractor:
     _HTML_TAG_RE = re.compile(r"<[a-zA-Z!/][^>\n]{0,300}>")
     _RAW_RSC_ROW_RE = re.compile(r"^[0-9a-zA-Z_\-]+:")
 
-    def __init__(self, html: Any, *, strict: bool = False):
+    def __init__(self, html: Any, *, strict: bool = False, repair: bool = False):
+        if strict and repair:
+            raise ValueError(
+                "strict=True and repair=True are mutually exclusive: "
+                "strict asks to fail loudly on malformed rows, repair asks "
+                "to recover them heuristically instead."
+            )
         self.html = _coerce_html(html)
         self.strict = strict
+        self.repair = repair
+        # Populated by `_materialize_chunk` when `repair=True` salvages (or
+        # fails to salvage) a chunk -- see `parse_confidence()`.
+        self._repair_outcomes: dict[str, bool] = {}
+        # Counters for `.stats()`'s cache visibility -- incremented in
+        # `resolve_chunk`. A cache-miss simply means "this chunk id
+        # hadn't been resolved yet", not an error; a page touched once
+        # via `resolve_all()` will show mostly misses (first-time
+        # resolves) and hits only from chunks reached more than once via
+        # different `$`-ref paths, whereas a page probed repeatedly via
+        # `.get()`/`.select()` on the same paths should show a high hit
+        # ratio after the first call.
+        self._cache_hits = 0
+        self._cache_misses = 0
         # Lazily-decoded view over each chunk's raw JSON -- see
         # _LazyRawChunks and _materialize_chunk. The raw row text and row
         # kind are what actually get populated during parsing (cheap);
@@ -420,6 +634,71 @@ class FlightExtractor:
         m = cls._RSC_PARAM_RE.search(html)
         return m.group(1) if m else None
 
+    @classmethod
+    def from_page(cls, page: Any, *, strict: bool = False, repair: bool = False) -> "FlightExtractor":
+        """Build an extractor from a Playwright `Page` object's *current,
+        fully-rendered* HTML -- for sites that only populate later
+        `self.__next_f.push(...)` chunks after client-side JS runs
+        (Suspense boundaries resolving, client-side data fetches, etc.),
+        where `from_url`'s plain HTTP GET would only see the initial
+        server-rendered chunks.
+
+            from playwright.sync_api import sync_playwright
+            from nextflight import FlightExtractor
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page()
+                page.goto("https://example.com/product/123")
+                page.wait_for_load_state("networkidle")  # let streamed chunks finish arriving
+                extractor = FlightExtractor.from_page(page)
+                browser.close()
+
+        Works with Playwright's sync API (`page.content()` returns a
+        `str` directly, as above) and its async API (`await
+        page.content()`) transparently -- this method itself stays a
+        plain classmethod either way; only the caller's `await` differs::
+
+            extractor = FlightExtractor.from_page(await async_page.content())
+
+        Actually, simpler and more robust than trying to detect
+        sync-vs-async `Page` objects internally (which would need to
+        special-case two different Playwright APIs and would break if a
+        future Playwright version changes its internals): pass the
+        *already-fetched* HTML string directly, from either API's
+        `.content()` call -- `from_page` also accepts a plain string for
+        exactly this reason, in which case it's simply
+        `FlightExtractor(html, ...)`.  Passing an object with a
+        synchronous `.content()` method (Playwright's sync `Page`) is
+        also accepted directly, since that's the common case and needs
+        no `await` gymnastics from the caller.
+
+        No Playwright dependency is required to use the rest of
+        `nextflight` -- this only needs Playwright installed
+        (`pip install playwright` -- not bundled in any `nextflight`
+        extra, since it also requires a separate `playwright install`
+        browser-download step that isn't a normal pip dependency at all)
+        if you actually call this method. A Selenium equivalent isn't
+        provided here since Selenium's `driver.page_source` needs no
+        `nextflight`-specific wrapping at all -- just call
+        `FlightExtractor(driver.page_source)` directly.
+        """
+        if isinstance(page, str):
+            html = page
+        elif hasattr(page, "content") and not _is_coroutine_function(page.content):
+            # Playwright's sync API: `page.content()` returns `str`
+            # directly, no `await` needed.
+            html = page.content()
+        else:
+            raise TypeError(
+                "from_page() expects a Playwright sync Page (with a "
+                "synchronous .content() method) or a plain HTML string. "
+                "For Playwright's async API, await page.content() "
+                "yourself and pass the resulting string: "
+                "FlightExtractor.from_page(await page.content())."
+            )
+        return cls(html, strict=strict, repair=repair)
+
     # ------------------------------------------------------------------ #
     # Step 1 -- find every push([...]) call, bracket/quote aware, so it
     # doesn't matter how many <script> tags they're spread across.
@@ -428,13 +707,19 @@ class FlightExtractor:
         found_wrapped = False
         for m in self._PUSH_CALL_RE.finditer(self.html):
             found_wrapped = True
-            array_text, _end = self._read_balanced(self.html, m.end(), "[", "]")
+            array_text, _end, value = _fast_bracket_decode(self.html, m.end())
             if array_text is None:
-                continue
-            try:
-                value = _json_loads(array_text)
-            except _JSON_ERRORS:
-                continue
+                # Fall back to the tolerant hand-rolled scan (handles
+                # malformed/truncated push() calls the same way this did
+                # before this optimization) -- then still needs its own
+                # decode, since `_read_balanced` only finds boundaries.
+                array_text, _end = self._read_balanced(self.html, m.end(), "[", "]")
+                if array_text is None:
+                    continue
+                try:
+                    value = _json_loads(array_text)
+                except _JSON_ERRORS:
+                    continue
             # push([0]) is an init call with no payload string; the ones we
             # want look like push([1, "...rows..."])
             if isinstance(value, list) and len(value) > 1 and isinstance(value[1], str):
@@ -531,6 +816,13 @@ class FlightExtractor:
     # honouring the real row grammar (this is what a '\n'.split() breaks).
     # ------------------------------------------------------------------ #
     def _split_rows(self, payload: str) -> Iterator[tuple]:
+        """Yields ``(chunk_id, row_type, raw_value, precomputed_value)``
+        for each row. `precomputed_value` is the already-decoded JSON
+        value when the fast path (`_fast_bracket_decode`) successfully
+        decoded it inline, or `None` when it wasn't attempted or fell
+        back to the tolerant `_read_balanced` path -- callers that don't
+        care about the precomputed value (this is purely an optimization,
+        not part of the row grammar) can simply ignore the 4th element."""
         i = 0
         n = len(payload)
         while i < n:
@@ -581,30 +873,39 @@ class FlightExtractor:
                             f"chunk {chunk_id!r}: text row body truncated "
                             f"(expected {hex_len} bytes, got {got_bytes})"
                         )
-                    yield chunk_id, "text", text_str
+                    yield chunk_id, "text", text_str, None
                     break
                 i = body_start + len(text_str)
-                yield chunk_id, "text", text_str
+                yield chunk_id, "text", text_str, None
             elif payload[i:i + 2] == "HL":
-                val, end = self._read_balanced(payload, i + 2, "[", "]")
+                val, end, decoded = _fast_bracket_decode(payload, i + 2)
                 if val is None:
-                    break
+                    val, end = self._read_balanced(payload, i + 2, "[", "]")
+                    if val is None:
+                        break
                 i = end
-                yield chunk_id, "preload", val
+                yield chunk_id, "preload", val, decoded
             elif payload[i] == "I":
-                val, end = self._read_balanced(payload, i + 1, "[", "]")
+                val, end, decoded = _fast_bracket_decode(payload, i + 1)
                 if val is None:
-                    break
+                    val, end = self._read_balanced(payload, i + 1, "[", "]")
+                    if val is None:
+                        break
                 i = end
-                yield chunk_id, "module", val
+                yield chunk_id, "module", val, decoded
             else:
+                decoded = None
                 if payload[i] in "[{":
                     close_ch = "]" if payload[i] == "[" else "}"
-                    val, end = self._read_balanced(payload, i, payload[i], close_ch)
-                    if val is None:
-                        val, i = payload[i:], n
-                    else:
+                    val, end, decoded = _fast_bracket_decode(payload, i)
+                    if val is not None:
                         i = end
+                    else:
+                        val, end = self._read_balanced(payload, i, payload[i], close_ch)
+                        if val is None:
+                            val, i = payload[i:], n
+                        else:
+                            i = end
                 elif payload[i] == '"':
                     val = self._read_quoted_string(payload, i)
                     i += len(val)
@@ -618,7 +919,7 @@ class FlightExtractor:
                     nxt = self._NEXT_ROW_RE.search(payload, i)
                     end = nxt.start() if nxt else n
                     val, i = payload[i:end], end
-                yield chunk_id, "json", val
+                yield chunk_id, "json", val, decoded
 
     @staticmethod
     def _read_text_row_body(payload: str, body_start: int, hex_len: int) -> tuple:
@@ -676,17 +977,75 @@ class FlightExtractor:
         return text[start:]
 
     def _extract_all(self) -> None:
-        for payload in self._iter_push_payloads():
-            for chunk_id, row_type, raw_value in self._split_rows(payload):
-                self._row_types[chunk_id] = row_type
-                self._raw_row_text[chunk_id] = raw_value
-                if self.strict:
-                    # strict=True means "tell me immediately if anything
-                    # on this page is malformed" -- materialize (and so
-                    # validate) every row right away rather than waiting
-                    # for something to access it, so a chunk nobody ever
-                    # looks at can still fail construction as before.
-                    self._materialize_chunk(chunk_id)
+        # Next.js's Flight stream doesn't guarantee one row (or even one
+        # complete row) per self.__next_f.push() call: for a page with
+        # enough data, the browser-side buffer for a given stream gets
+        # flushed mid-string, so a single logical row's raw text can be
+        # split across two (or more) separate push() calls with NO
+        # separator between the pieces -- concatenating them is required
+        # to reconstruct the real, continuous row stream before it can be
+        # split into rows at all. Treating each push() call as an
+        # independently complete set of rows (the previous approach) works
+        # by coincidence on smaller pages where every row happens to fit
+        # in one push() call, but silently produces garbage chunk ids
+        # (fragments of URLs, etc.) on larger real-world pages where it
+        # doesn't -- confirmed against production Next.js pages where over
+        # half of all push() calls were mid-row continuations.
+        combined = "".join(self._iter_push_payloads())
+        dup_counts: dict[str, int] = {}
+        for chunk_id, row_type, raw_value, precomputed in self._split_rows(combined):
+            key = chunk_id
+            if key in self._row_types:
+                # Duplicate chunk id. Confirmed on real pages: Next.js
+                # deliberately emits many `HL` (preload) rows with a
+                # completely empty id (":HL[\"/path.css\",\"style\"]") since
+                # nothing ever needs to `$`-ref them individually -- on one
+                # real page, 43 separate preload rows all shared the empty
+                # id. Silently overwriting would keep only the last one and
+                # under-report the true row count. The FIRST occurrence
+                # keeps its original id untouched (so `$`-ref resolution
+                # into it is unaffected); every later occurrence gets a
+                # synthesized, clearly-marked unique key instead -- it was
+                # never uniquely `$`-ref-addressable anyway once its id
+                # collided, so nothing that used to work stops working.
+                n = dup_counts.get(chunk_id, 1) + 1
+                # A real chunk id can only contain [0-9a-zA-Z_-] (see
+                # _ROW_START_RE), so it can never itself contain "#" --
+                # a synthesized key can't collide with a genuine one. This
+                # loop is defensive housekeeping in case that ever changes,
+                # not a case that can currently be hit.
+                while f"{chunk_id}#{n}" in self._row_types:
+                    n += 1
+                dup_counts[chunk_id] = n
+                key = f"{chunk_id}#{n}"
+            self._row_types[key] = row_type
+            self._raw_row_text[key] = raw_value
+            if self.strict:
+                # strict=True means "tell me immediately if anything on
+                # this page is malformed" -- materialize (and so
+                # validate) every row right away rather than waiting for
+                # something to access it, so a chunk nobody ever looks at
+                # can still fail construction as before. Since strict
+                # mode already eagerly materializes every chunk by
+                # design, reusing `precomputed` here (the value
+                # `_split_rows` already decoded while finding this row's
+                # boundary -- see `_fast_bracket_decode`) whenever it's
+                # available avoids a second, redundant decode -- this is
+                # NOT a laziness violation, since strict mode was never
+                # lazy about materialization to begin with.
+                if precomputed is not None:
+                    self._materialized[key] = precomputed
+                else:
+                    self._materialize_chunk(key)
+            # else: `precomputed` is deliberately discarded here even
+            # though we already have it for free. Construction must stay
+            # honestly lazy in the non-strict (default) case: a page with
+            # many chunks a caller never looks at (the whole point of
+            # `_LazyRawChunks`) should not have every chunk's decoded
+            # Python object materialized and held in memory just because
+            # finding row boundaries happened to decode it along the way.
+            # `_materialize_chunk` re-decodes from `raw_value` on first
+            # real access instead, same as before this optimization.
 
     def _materialize_chunk(self, chunk_id: str) -> Any:
         """JSON-decode a single chunk's raw row text (see
@@ -716,13 +1075,88 @@ class FlightExtractor:
                 try:
                     value = _json_loads(raw_value)
                 except _JSON_ERRORS:
-                    if self.strict and not raw_value.startswith("$"):
+                    if self.repair and raw_value[:1] in "[{":
+                        repaired = self._attempt_repair(raw_value)
+                        if repaired is not None:
+                            self._repair_outcomes[chunk_id] = True
+                            value = repaired
+                        else:
+                            self._repair_outcomes[chunk_id] = False
+                            value = raw_value
+                    elif self.strict and not raw_value.startswith("$"):
                         raise FlightParseError(
                             f"chunk {chunk_id!r}: invalid JSON: {raw_value[:80]!r}"
                         )
-                    value = raw_value  # bare marker e.g. "X"
+                    else:
+                        value = raw_value  # bare marker e.g. "X"
         self._materialized[chunk_id] = value
         return value
+
+    @staticmethod
+    def _attempt_repair(raw_value: str) -> Any:
+        """Best-effort recovery for a JSON-looking row that failed to
+        decode -- most commonly because the surrounding HTML response was
+        truncated mid-chunk by a proxy/CDN. Heuristically closes unbalanced
+        quotes and brackets/braces (tracking string state so bracket
+        characters inside string literals aren't miscounted), then retries
+        the decode, backing off one trailing partial token at a time if it
+        still doesn't parse. Returns the decoded value, or ``None`` if
+        nothing recoverable could be produced.
+
+        This is deliberately conservative: it never guesses at *missing*
+        data (e.g. it won't invent a value for a truncated key), it only
+        closes what's already open so however much of the structure did
+        arrive intact can still be decoded."""
+        text = raw_value
+        for _ in range(3):
+            candidate = FlightExtractor._close_unbalanced(text)
+            try:
+                return _json_loads(candidate)
+            except _JSON_ERRORS:
+                # Trim the last partial token (likely a truncated key or
+                # value fragment) and try again.
+                trimmed = re.sub(r'[,:]?\s*"[^"]*$', "", text)
+                trimmed = re.sub(r",\s*$", "", trimmed)
+                if trimmed == text or not trimmed:
+                    break
+                text = trimmed
+        return None
+
+    @staticmethod
+    def _close_unbalanced(text: str) -> str:
+        stack: list = []
+        in_string = False
+        escape = False
+        for ch in text:
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "[{":
+                stack.append("]" if ch == "[" else "}")
+            elif ch in "]}":
+                if stack and stack[-1] == ch:
+                    stack.pop()
+        closing = ""
+        if in_string:
+            if escape:
+                # The text ends on a dangling, unconsumed escape
+                # backslash (e.g. text ends `..."\`) -- naively closing
+                # with just a `"` would produce `\"`, which JSON parses
+                # as an *escaped* quote inside the string, not a
+                # terminator, leaving the string open. Complete the
+                # dangling escape as a literal backslash first (`\\`)
+                # so the quote that follows actually closes the string.
+                closing += "\\"
+            closing += '"'
+        closing += "".join(reversed(stack))
+        return text + closing
 
     # ------------------------------------------------------------------ #
     # Step 3 -- resolve '$'-sigil references into real values, recursively.
@@ -730,7 +1164,9 @@ class FlightExtractor:
     def resolve_chunk(self, chunk_id: str) -> Any:
         """Resolve a single chunk (by its id) with all `$`-refs dereferenced."""
         if chunk_id in self._resolved_cache:
+            self._cache_hits += 1
             return self._resolved_cache[chunk_id]
+        self._cache_misses += 1
         if chunk_id in self._resolving or chunk_id not in self.raw_chunks:
             return None
         self._resolving.add(chunk_id)
@@ -1001,15 +1437,40 @@ class FlightExtractor:
         )
 
     def find_all_by_keys(self, required_keys: Iterable[str], root: Any = None,
-                          include_source: bool = False) -> list:
+                          include_source: bool = False, dedupe: bool = False) -> list:
         """Like :meth:`find_by_keys` but returns every matching dict, not
         just the first -- useful for pages with repeated cards/listings
-        that all share the same shape (product cards, search results, ...)."""
+        that all share the same shape (product cards, search results, ...).
+
+        `dedupe`: Flight payloads commonly serialize the same underlying
+        object twice at different tree positions (e.g. a listing embedded
+        both in a carousel and a full results grid). When True, collapse
+        matches that are equal after JSON-serialization (so key order
+        doesn't cause false negatives) down to the first occurrence,
+        instead of surfacing every redundant copy. Off by default to keep
+        existing call sites' output unchanged; `include_source=True`
+        results are deduped on the matched value only, keeping each kept
+        result's original `(value, source)` pair."""
         required_keys = set(required_keys)
-        return self.find_all(
+        results = self.find_all(
             lambda n: isinstance(n, dict) and required_keys <= n.keys(),
             root=root, include_source=include_source,
         )
+        if not dedupe:
+            return results
+        seen: set = set()
+        deduped = []
+        for r in results:
+            value = r[0] if include_source else r
+            try:
+                fingerprint = _json_dumps_sorted(value)
+            except TypeError:
+                fingerprint = repr(value)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            deduped.append(r)
+        return deduped
 
     def find_any_keys(self, any_keys: Iterable[str], root: Any = None,
                        include_source: bool = False) -> list:
@@ -1135,12 +1596,241 @@ class FlightExtractor:
             "json_chunk_count": len(self.json_keys()),
             "html_chunk_count": len(self.html_keys()),
             "html_size_bytes": len(self.html.encode("utf-8")),
+            "resolve_cache_hits": self._cache_hits,
+            "resolve_cache_misses": self._cache_misses,
         }
+
+    def parse_confidence(self) -> dict:
+        """A score/summary of how cleanly this page's rows parsed, so you
+        can flag pages that need investigation instead of manually
+        re-reading every row. Returns::
+
+            {
+                "score": 0.0-1.0,           # clean rows / total rows
+                "total_chunks": int,
+                "clean_chunks": int,        # decoded as real JSON/text
+                "raw_string_chunks": int,   # fell back to a raw string
+                "repaired_chunks": int,     # recovered via repair=True
+                "failed_repair_chunks": int,
+            }
+
+        A raw-string fallback isn't necessarily a bug -- bare `$`-ref
+        markers and symbol names are *expected* to stay as strings -- but
+        a page where most chunks fell back is a strong signal something
+        about its wire format isn't being recognized (see
+        :meth:`next_version_hint`)."""
+        total = len(self.raw_chunks)
+        raw_string_count = 0
+        for cid in self.raw_chunks:
+            self._materialize_chunk(cid)  # ensure repair/fallback has run
+            row_type = self._row_types[cid]
+            if row_type == "text":
+                continue
+            if isinstance(self._materialized.get(cid), str):
+                raw_string_count += 1
+        repaired = sum(1 for ok in self._repair_outcomes.values() if ok)
+        failed_repair = sum(1 for ok in self._repair_outcomes.values() if not ok)
+        clean = total - raw_string_count
+        return {
+            "score": (clean / total) if total else 1.0,
+            "total_chunks": total,
+            "clean_chunks": clean,
+            "raw_string_chunks": raw_string_count,
+            "repaired_chunks": repaired,
+            "failed_repair_chunks": failed_repair,
+        }
+
+    def next_version_hint(self) -> dict:
+        """Best-effort guess at which Next.js version range produced this
+        page's Flight payload, based on wire-format markers checked
+        against the bundled :mod:`nextflight` ``known_formats.yaml``
+        registry (see that file for the underlying, citable reference).
+
+        Returns ``{"range": str | None, "notes": str | None, "matches":
+        [str, ...]}`` -- `matches` lists every candidate range whose
+        markers were found, since marker sets can overlap between
+        adjacent versions; `range`/`notes` are simply the last (i.e. most
+        recent) match, a reasonable default when several match. Returns
+        an all-``None``/empty result if no known markers were found at
+        all -- not an error, just "this library doesn't have a fingerprint
+        for whatever produced this page yet." Parsing itself does not
+        depend on this result; it degrades gracefully either way."""
+        registry = _load_known_formats()
+        matches = []
+        for entry in registry:
+            markers = entry.get("markers") or []
+            if markers and all(marker in self.html for marker in markers):
+                matches.append(entry)
+        if not matches:
+            return {"range": None, "notes": None, "matches": []}
+        best = matches[-1]
+        return {
+            "range": best.get("range"),
+            "notes": (best.get("notes") or "").strip() or None,
+            "matches": [m.get("range") for m in matches],
+        }
+
+    def suggest_similar_keys(self, required_keys: Iterable[str], *, cutoff: float = 0.6,
+                              max_suggestions: int = 5) -> dict:
+        """When :meth:`find_by_keys`/:meth:`find_all_by_keys` comes back
+        empty, fuzzy-match `required_keys` against every key actually
+        present anywhere in the resolved tree, to help debug "why didn't
+        this match" instead of silently getting `None`/`[]` back.
+
+        Returns ``{key: [similar_key, ...]}`` for each of `required_keys`,
+        ordered by similarity (best first). A key with no reasonably
+        similar match anywhere on the page gets an empty list -- that's a
+        much stronger signal ("this field probably isn't on this page/this
+        build at all") than a fuzzy near-miss is."""
+        import difflib
+
+        present: set = set()
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                present.update(node.keys())
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(self.resolve_all())
+        present_list = sorted(present)
+        return {
+            key: difflib.get_close_matches(key, present_list, n=max_suggestions, cutoff=cutoff)
+            for key in required_keys
+        }
+
+    def extract_as(self, model: type, *, root: Any = None,
+                    required_keys: Optional[Iterable[str]] = None) -> Any:
+        """Find the first dict matching `required_keys` (defaulting to the
+        target's own field names) and coerce it into `model` -- a stdlib
+        `dataclasses.dataclass`, or (if the optional `pydantic` extra is
+        installed) a pydantic `BaseModel`. Extra keys present in the
+        matched dict but not on `model` are ignored; missing keys that
+        have no default raise the model's own validation error, so a
+        shape mismatch fails loudly rather than silently returning a
+        half-populated object.
+
+            @dataclass
+            class Listing:
+                title: str
+                price: float
+
+            listing = page.extract_as(Listing)
+
+        Returns `None` if no matching dict is found at all. This is a
+        thin, optional convenience on top of :meth:`find_by_keys` --
+        nothing about the core extraction path depends on it, and no
+        schema library is required unless you actually call this."""
+        import dataclasses
+
+        model_fields = getattr(model, "model_fields", None)
+        is_pydantic = model_fields is not None
+        is_dataclass = dataclasses.is_dataclass(model)
+        if not (is_pydantic or is_dataclass):
+            raise TypeError(
+                f"{model!r} is neither a dataclass nor a pydantic BaseModel"
+            )
+        if required_keys is None:
+            if is_pydantic:
+                assert model_fields is not None
+                required_keys = list(model_fields.keys())
+            else:
+                required_keys = [f.name for f in dataclasses.fields(model)]
+        match = self.find_by_keys(required_keys, root=root)
+        if match is None:
+            return None
+        if is_pydantic:
+            return model(**match)
+        field_names = {f.name for f in dataclasses.fields(model)}
+        return model(**{k: v for k, v in match.items() if k in field_names})
+
+    @classmethod
+    def from_stream(cls, chunks: Iterable[Union[str, bytes]], *, strict: bool = False,
+                     repair: bool = False) -> Iterator[tuple]:
+        """Incrementally parse an iterable of HTML fragments/bytes (e.g. a
+        `requests`/`httpx` streaming response body, read chunk-by-chunk)
+        and yield ``(chunk_id, resolved_value)`` pairs as soon as each
+        Flight row completes, without requiring the full page in memory
+        first.
+
+        This is necessarily coarser than parsing a complete page: `$`-ref
+        resolution for a chunk can only be fully accurate once every chunk
+        it might point to has arrived (a ref to a not-yet-seen chunk id
+        resolves to `None` for a stream, whereas a completed-page
+        `FlightExtractor` would resolve it correctly) -- rows are yielded
+        best-effort, in arrival order, re-resolving already-yielded ids as
+        later chunks that complete them arrive is deliberately NOT done,
+        since redoing that lazily on a live stream would mean re-yielding
+        the same id repeatedly. For a use case where getting every
+        cross-reference exactly right matters more than seeing data as it
+        streams in, buffer the full response and use the regular
+        `FlightExtractor` constructor instead; this is for cases where
+        acting on data as it arrives (e.g. a live progress indicator, or
+        stopping a slow crawl early once the wanted field shows up) is
+        the actual goal.
+
+        Performance note: each new piece triggers a fresh re-scan of the
+        entire buffer accumulated so far (necessary for correctness --
+        `push()` calls and rows can only be recognized once complete, and
+        something that looks like the start of one near the end of a
+        piece might only actually complete in a later one). This makes
+        total work quadratic in the number of pieces for a given total
+        size: fine for a normal page streamed in the tens to low hundreds
+        of pieces typical of a real HTTP response (a ~200KB page streamed
+        in ~200-byte pieces finishes in well under a second), but a poor
+        fit for a very large page deliberately split into many hundreds
+        of tiny fragments -- that case should buffer and use the regular
+        constructor instead.
+        """
+        buffer = ""
+        extractor = cls.__new__(cls)
+        extractor.html = ""
+        extractor.strict = strict
+        extractor.repair = repair
+        extractor.raw_chunks = _LazyRawChunks(extractor)
+        extractor._row_types = {}
+        extractor._raw_row_text = {}
+        extractor._materialized = {}
+        extractor._resolved_cache = {}
+        extractor._resolving = set()
+        extractor._resolving_paths = set()
+        extractor._repair_outcomes = {}
+        extractor._cache_hits = 0
+        extractor._cache_misses = 0
+        seen_ids: set = set()
+        for piece in chunks:
+            if isinstance(piece, (bytes, bytearray)):
+                piece = bytes(piece).decode("utf-8", errors="replace")
+            buffer += piece
+            extractor.html = buffer
+            # Recompute from the accumulated HTML each time a new piece
+            # arrives: only *complete* self.__next_f.push(...) calls (and
+            # complete rows within their concatenated payload) show up
+            # here at all -- `_iter_push_payloads`/`_split_rows` both stop
+            # cleanly at whatever's still in flight, so this never yields
+            # a row before it's fully arrived. Re-scanning the whole
+            # buffer on every piece is O(n^2) over a very long-lived
+            # stream, which is an acceptable trade for correctness in the
+            # common case (a normal page response streamed in a handful
+            # of chunks) -- callers with pathologically large/long-lived
+            # streams should buffer and use the regular constructor
+            # instead, per the docstring above.
+            combined = "".join(extractor._iter_push_payloads())
+            for chunk_id, row_type, raw_value, _precomputed in extractor._split_rows(combined):
+                if chunk_id in seen_ids:
+                    continue
+                seen_ids.add(chunk_id)
+                extractor._row_types[chunk_id] = row_type
+                extractor._raw_row_text[chunk_id] = raw_value
+                yield chunk_id, extractor.resolve_chunk(chunk_id)
 
     def to_json(self, path: Optional[str] = None, *, indent: int = 2) -> Optional[str]:
         """Dump the fully resolved page as JSON. Writes to `path` if given
         (returns None), otherwise returns the JSON string."""
-        text = json.dumps(self.resolve_all(), indent=indent, ensure_ascii=False, default=str)
+        text = _json_dumps(self.resolve_all(), indent=indent)
         if path is None:
             return text
         with open(path, "w", encoding="utf-8") as f:
@@ -1196,6 +1886,29 @@ class FlightExtractor:
         if required_keys is None:
             raise ValueError("Pass either `records` or `required_keys` to build them from the page.")
         return self.find_all_by_keys(required_keys)
+
+
+class AsyncFlightExtractor(FlightExtractor):
+    """Thin, discoverable alias for the async construction path.
+
+    `FlightExtractor` already supports async fetching via
+    ``await FlightExtractor.from_url_async(url)`` (see that method) -- the
+    class itself has no async state, only its *construction* can be
+    async, since parsing a page you already hold in memory is pure CPU
+    work. `AsyncFlightExtractor` exists purely so that code (and search
+    results, and IDE autocomplete) reaching for "the async one" for
+    concurrent multi-page crawling finds it under the name it's looking
+    for; it is otherwise byte-for-byte the same class::
+
+        pages = await asyncio.gather(*(
+            AsyncFlightExtractor.from_url_async(u) for u in urls
+        ))
+
+    Requires the optional `httpx` dependency (``pip install
+    nextflight[async]``); see :meth:`FlightExtractor.from_url_async`,
+    inherited here unchanged (subclassing preserves `cls`-based
+    dispatch, so this correctly constructs `AsyncFlightExtractor`
+    instances rather than plain `FlightExtractor` ones)."""
 
 
 def find_json_ld(html: Any, type_: Optional[str] = None) -> list:

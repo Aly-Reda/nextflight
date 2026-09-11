@@ -1395,3 +1395,493 @@ def test_from_rsc_url_auto_discover_false_skips_extra_fetch():
         assert plain_fetch_count["n"] == 0
     finally:
         server.shutdown()
+
+
+# ------------------------------------------------------------------ #
+# Multi-push row continuation: on real, sufficiently large production
+# Next.js pages, a single logical row's raw text can be split across two
+# (or more) separate self.__next_f.push() calls with NO separator between
+# the pieces -- the browser-side stream buffer gets flushed mid-string.
+# Treating each push() call as an independently complete set of rows
+# (the previous approach) works by coincidence on small pages but produces
+# garbage chunk ids (fragments of whatever was mid-string, e.g. a URL) on
+# real pages where a row happens to straddle a push() boundary. Found via
+# strict=True validation against real production HTML, where a chunk id
+# of "https" turned out to be the tail of a URL that had been split
+# across two push() calls.
+# ------------------------------------------------------------------ #
+def test_row_split_across_two_push_calls_is_reassembled():
+    # Simulates the real-world case: a module row's URL array is split
+    # mid-string across two separate push() calls with no separator.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"3:I[897367,[\\"https://cdn.example.com/chunks/a"'
+        '])</script>'
+        '<script>self.__next_f.push([1, '
+        '".js\\",\\"https://cdn.example.com/chunks/b.js\\"],\\"Boundary\\"]"'
+        '])</script>'
+    )
+    page = extract(html)
+    # A naive per-payload parser would produce a bogus chunk id from the
+    # tail of the split URL (e.g. "js") instead of correctly reassembling
+    # chunk "3" as one continuous module row.
+    assert set(page.keys()) == {"3"}
+    resolved = page.resolve_chunk("3")
+    assert resolved == [
+        897367,
+        ["https://cdn.example.com/chunks/a.js", "https://cdn.example.com/chunks/b.js"],
+        "Boundary",
+    ]
+
+
+def test_row_split_across_three_push_calls_is_reassembled():
+    html = (
+        '<script>self.__next_f.push([1, "0:{\\"a\\":\\"pa"])</script>'
+        '<script>self.__next_f.push([1, "rt-tw"])</script>'
+        '<script>self.__next_f.push([1, "o\\"}"])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_chunk("0") == {"a": "part-two"}
+
+
+def test_normal_multi_push_pages_are_unaffected_by_reassembly():
+    # The common case -- each push() call contains one or more COMPLETE
+    # rows, nothing split -- must still work exactly as before.
+    html = (
+        '<script>self.__next_f.push([1, "0:{\\"a\\":1}"])</script>'
+        '<script>self.__next_f.push([1, "1:{\\"b\\":2}\\n2:{\\"c\\":3}"])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_all() == {"0": {"a": 1}, "1": {"b": 2}, "2": {"c": 3}}
+
+
+# ------------------------------------------------------------------ #
+# Duplicate chunk ids: Next.js deliberately emits many "HL" (preload)
+# rows with a completely empty id (":HL[\"/path.css\",\"style\"]"), since
+# nothing ever needs to $-ref them individually -- confirmed on a real
+# page with 43 such rows all sharing the empty id. Silently overwriting
+# by dict-key collision would keep only the last one. Duplicates get a
+# synthesized, clearly-marked unique key ("id#2", "id#3", ...) instead;
+# the first occurrence keeps its original id untouched.
+# ------------------------------------------------------------------ #
+def test_duplicate_empty_id_preload_rows_all_preserved():
+    html = (
+        '<script>self.__next_f.push([1, '
+        '":HL[\\"/a.css\\",\\"style\\"]\\n'
+        ':HL[\\"/b.css\\",\\"style\\"]\\n'
+        ':HL[\\"/c.css\\",\\"style\\"]\\n'
+        '0:{\\"real\\":1}"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert len(page) == 4
+    assert set(page.keys()) == {"", "#2", "#3", "0"}
+    assert page.raw_chunks[""] == ["/a.css", "style"]
+    assert page.raw_chunks["#2"] == ["/b.css", "style"]
+    assert page.raw_chunks["#3"] == ["/c.css", "style"]
+    assert page.resolve_chunk("0") == {"real": 1}
+
+
+def test_duplicate_non_empty_id_also_gets_synthesized_key():
+    # The same handling applies to any duplicate id, not just the empty
+    # one -- the first occurrence is untouched (and stays $-ref-resolvable
+    # under its real id); later ones get "id#2", "id#3", etc.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"5:{\\"first\\":true}\\n'
+        '5:{\\"second\\":true}\\n'
+        '5:{\\"third\\":true}\\n'
+        '9:\\"$5\\""'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_chunk("5") == {"first": True}
+    assert page.resolve_chunk("5#2") == {"second": True}
+    assert page.resolve_chunk("5#3") == {"third": True}
+    # A $-ref to the (duplicated) id resolves to the FIRST occurrence,
+    # matching what raw_chunks["5"] itself resolves to.
+    assert page.resolve_chunk("9") == {"first": True}
+
+
+def test_duplicate_key_synthesis_handles_many_repeats_of_same_id():
+    # A chunk id can only ever contain [0-9a-zA-Z_-] (see _ROW_START_RE),
+    # so a real id can never itself contain "#" -- synthesized keys can
+    # never collide with a genuine one. This checks the simpler but still
+    # important guarantee: many repeats of the same id all get distinct,
+    # correctly incrementing synthesized keys, not just the first repeat.
+    html = (
+        '<script>self.__next_f.push([1, '
+        '"5:{\\"n\\":1}\\n5:{\\"n\\":2}\\n5:{\\"n\\":3}\\n5:{\\"n\\":4}\\n5:{\\"n\\":5}"'
+        '])</script>'
+    )
+    page = extract(html)
+    assert page.resolve_chunk("5") == {"n": 1}
+    assert page.resolve_chunk("5#2") == {"n": 2}
+    assert page.resolve_chunk("5#3") == {"n": 3}
+    assert page.resolve_chunk("5#4") == {"n": 4}
+    assert page.resolve_chunk("5#5") == {"n": 5}
+    assert len(page) == 5
+
+
+def test_no_duplicates_means_keys_are_unaffected():
+    # Sanity: the common case (no duplicate ids at all) must produce
+    # exactly the same keys as always, with no "#" suffixes appearing.
+    html = '<script>self.__next_f.push([1, "0:{\\"a\\":1}\\n1:{\\"b\\":2}"])</script>'
+    page = extract(html)
+    assert set(page.keys()) == {"0", "1"}
+
+
+
+
+# ---------------------------------------------------------------------- #
+# v0.3.7: parsing robustness (repair mode, streaming, version hint),
+# observability (parse_confidence), API ergonomics (suggest_similar_keys,
+# extract_as, dedupe), and data-quality post-processing helpers.
+#
+# `_push_html` builds a valid self.__next_f.push(...) snippet from plain
+# row strings (each already in the "id:json" wire form) without anyone
+# having to hand-escape nested quotes -- json.dumps does the one layer of
+# JS-string escaping needed since the row text becomes the single string
+# argument passed to push().
+# ---------------------------------------------------------------------- #
+import dataclasses
+
+from nextflight import normalize_price, clean_text, parse_date, AsyncFlightExtractor
+
+
+def _push_html(*rows):
+    payload = "\n".join(rows)
+    return "<script>self.__next_f.push([1," + json.dumps(payload) + "])</script>"
+
+
+def test_repair_mode_recovers_truncated_json_row():
+    html = _push_html('9:{"title":"Truncated","price":12')
+    without_repair = extract(html)
+    assert without_repair.resolve_chunk("9").startswith('{"title"')
+
+    repaired = FlightExtractor(html, repair=True)
+    assert repaired.resolve_chunk("9") == {"title": "Truncated", "price": 12}
+
+
+def test_repair_mode_gives_up_gracefully_on_unsalvageable_row():
+    html = _push_html('9:{"a":')
+    repaired = FlightExtractor(html, repair=True)
+    assert "9" in repaired.keys()
+
+
+def test_strict_and_repair_are_mutually_exclusive():
+    with pytest.raises(ValueError):
+        FlightExtractor(_push_html("0:{}"), strict=True, repair=True)
+
+
+def test_parse_confidence_all_clean():
+    html = _push_html('0:{"a":1}', '1:{"b":2}')
+    page = extract(html)
+    conf = page.parse_confidence()
+    assert conf["score"] == 1.0
+    assert conf["total_chunks"] == 2
+    assert conf["raw_string_chunks"] == 0
+
+
+def test_parse_confidence_counts_repaired_chunks():
+    html = _push_html('9:{"a":1')
+    page = FlightExtractor(html, repair=True)
+    conf = page.parse_confidence()
+    assert conf["repaired_chunks"] == 1
+    assert conf["failed_repair_chunks"] == 0
+
+
+def test_next_version_hint_matches_registry_entry():
+    html = _push_html('0:{"a":1}')
+    page = extract(html)
+    hint = page.next_version_hint()
+    assert hint["range"] is not None
+    assert isinstance(hint["matches"], list)
+
+
+def test_next_version_hint_no_markers_found():
+    page = extract("<html><body>not a next.js page</body></html>")
+    hint = page.next_version_hint()
+    assert hint == {"range": None, "notes": None, "matches": []}
+
+
+def test_suggest_similar_keys_finds_close_matches():
+    html = _push_html('0:{"title":"x","price":1}')
+    page = extract(html)
+    suggestions = page.suggest_similar_keys(["titl", "totally_unrelated_field"])
+    assert "title" in suggestions["titl"]
+    assert suggestions["totally_unrelated_field"] == []
+
+
+def test_find_all_by_keys_dedupe_collapses_duplicates():
+    html = _push_html(
+        '0:{"title":"A","price":1}',
+        '1:{"title":"A","price":1}',
+        '2:{"title":"B","price":2}',
+    )
+    page = extract(html)
+    without_dedupe = page.find_all_by_keys(["title", "price"])
+    deduped = page.find_all_by_keys(["title", "price"], dedupe=True)
+    assert len(without_dedupe) == 3
+    assert len(deduped) == 2
+
+
+def test_extract_as_dataclass():
+    html = _push_html('0:{"title":"Cool","price":99}')
+    page = extract(html)
+
+    @dataclasses.dataclass
+    class Item:
+        title: str
+        price: int
+
+    item = page.extract_as(Item)
+    assert item == Item(title="Cool", price=99)
+
+
+def test_extract_as_returns_none_when_no_match():
+    page = extract(_push_html('0:{"unrelated":1}'))
+
+    @dataclasses.dataclass
+    class Item:
+        title: str
+        price: int
+
+    assert page.extract_as(Item) is None
+
+
+def test_extract_as_rejects_non_model_types():
+    page = extract(_push_html('0:{"a":1}'))
+    with pytest.raises(TypeError):
+        page.extract_as(dict)
+
+
+def test_from_stream_yields_chunks_incrementally():
+    full = _push_html('5:{"a":1}', '6:{"b":2}')
+    midpoint = len(full) // 2
+
+    def gen():
+        yield full[:midpoint]
+        yield full[midpoint:]
+
+    results = dict(FlightExtractor.from_stream(gen()))
+    assert results == {"5": {"a": 1}, "6": {"b": 2}}
+
+
+def test_async_flight_extractor_is_a_flight_extractor_subclass():
+    assert issubclass(AsyncFlightExtractor, FlightExtractor)
+
+
+def test_normalize_price_dollar_with_thousands_separator():
+    assert normalize_price("$1,299.00") == {"amount": 1299.0, "currency": "USD"}
+
+
+def test_normalize_price_european_format():
+    assert normalize_price("1.299,00 €") == {"amount": 1299.0, "currency": "EUR"}
+
+
+def test_normalize_price_iso_code():
+    assert normalize_price("EUR 45") == {"amount": 45.0, "currency": "EUR"}
+
+
+def test_normalize_price_numeric_input():
+    assert normalize_price(1299) == {"amount": 1299.0, "currency": None}
+
+
+def test_normalize_price_no_number_returns_none():
+    assert normalize_price("Contact us") is None
+
+
+def test_normalize_price_none_returns_none():
+    assert normalize_price(None) is None
+
+
+def test_clean_text_decodes_entities_and_collapses_whitespace():
+    assert clean_text("  Hello&nbsp;&amp;  world  \n\n") == "Hello & world"
+
+
+def test_clean_text_none_passthrough():
+    assert clean_text(None) is None
+
+
+def test_parse_date_iso_format():
+    assert parse_date("2024-01-05") is not None
+
+
+def test_parse_date_natural_format():
+    d = parse_date("January 5, 2024")
+    assert d is not None
+    assert (d.year, d.month, d.day) == (2024, 1, 5)
+
+
+def test_parse_date_invalid_returns_none():
+    assert parse_date("not a date") is None
+
+
+def test_parse_date_empty_returns_none():
+    assert parse_date("") is None
+    assert parse_date(None) is None
+
+
+# -- regression tests for bugs found during code-quality review ----------
+
+def test_known_formats_fallback_parser_matches_pyyaml():
+    # Regression: a marker string containing its own colon (e.g. ":HL[")
+    # was previously misparsed as a nested key:value pair instead of a
+    # plain list item, dropping the marker and corrupting the entry.
+    from nextflight.extractor import _parse_simple_yaml_list
+
+    sample = (
+        '- range: "1.0"\n'
+        '  markers:\n'
+        '    - "a:b"\n'
+        '    - "c"\n'
+        '  notes: >\n'
+        '    line one\n'
+        '    line two\n'
+    )
+    parsed = _parse_simple_yaml_list(sample)
+    assert parsed == [{
+        "range": "1.0",
+        "markers": ["a:b", "c"],
+        "notes": "line one line two",
+    }]
+
+
+def test_known_formats_fallback_parser_matches_real_registry_file():
+    # The fallback parser must agree with pyyaml on the actual bundled
+    # registry, not just a synthetic sample -- this is what
+    # `next_version_hint()` depends on when pyyaml isn't installed.
+    import os
+    from nextflight.extractor import _parse_simple_yaml_list
+
+    path = os.path.join(os.path.dirname(__file__), "..", "src", "nextflight", "known_formats.yaml")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    parsed = _parse_simple_yaml_list(text)
+    assert len(parsed) >= 4
+    for entry in parsed:
+        assert "range" in entry
+        assert isinstance(entry.get("markers"), list) and entry["markers"]
+        assert isinstance(entry.get("notes"), str) and entry["notes"]
+    # The specific bug this guards against: a marker with an embedded
+    # colon must survive as its own list item, not get folded into a
+    # phantom "- \"" key.
+    all_markers = [m for entry in parsed for m in entry["markers"]]
+    assert ":HL[" in all_markers
+
+
+def test_normalize_price_iso_code_without_space():
+    # Regression: "USD1,234.56" (no space between the ISO code and the
+    # digits) previously fell through both the leading- and
+    # trailing-currency branches and came back with currency=None.
+    assert normalize_price("USD1,234.56") == {"amount": 1234.56, "currency": "USD"}
+
+
+def test_close_unbalanced_dangling_escape_at_string_end():
+    # Regression (found by hypothesis fuzzing): a string ending in a
+    # dangling, unconsumed escape backslash (text ends `..."\\`) used to
+    # be closed with a bare `"`, which JSON parses as an *escaped* quote
+    # inside the string rather than a terminator -- leaving the string
+    # open and producing invalid JSON.
+    import json as _json
+    from nextflight.extractor import FlightExtractor
+
+    closed = FlightExtractor._close_unbalanced('"\\')
+    assert _json.loads(closed) == "\\"
+
+
+def test_repair_mode_recovers_string_with_dangling_trailing_backslash():
+    html = _push_html('9:{"a":"value ends in backslash \\')
+    page = FlightExtractor(html, repair=True)
+    # Must not raise, and must actually salvage the value rather than
+    # silently falling back to the raw string.
+    result = page.resolve_chunk("9")
+    assert result == {"a": "value ends in backslash \\"}
+
+
+def test_stats_exposes_resolve_cache_hit_miss_counters():
+    html = _push_html(
+        '0:["$","div",null,{"children":["$1","$1","$1"]}]',
+        '1:{"a":1}',
+    )
+    page = extract(html)
+    page.resolve_all()
+    stats = page.stats()
+    # Chunk "1" is referenced three times from chunk "0"'s children, plus
+    # resolved once directly as a top-level chunk by resolve_all() itself
+    # -- the first of those four lookups is a miss (nothing cached yet for
+    # "1"), the other three are hits.
+    assert stats["resolve_cache_misses"] >= 2  # "0" and "1" each resolved at least once
+    assert stats["resolve_cache_hits"] >= 3    # the three repeated "$1" refs
+
+
+def test_stats_cache_counters_start_at_zero():
+    page = extract(_push_html('0:{"a":1}'))
+    stats = page.stats()
+    assert stats["resolve_cache_hits"] == 0
+    assert stats["resolve_cache_misses"] == 0
+
+
+def test_find_by_keys_lazy_resolution_measured_via_cache():
+    # Direct, load-bearing verification (not just code review) that an
+    # early match in find_by_keys/find_one does NOT eagerly resolve the
+    # whole page: build a page with many chunks and a match near the
+    # front, then confirm only a small prefix ever entered the resolve
+    # cache.
+    rows = [f'{i}:{{"id":{i}}}' for i in range(200)]
+    rows[5] = '5:{"price":10,"title":"needle"}'
+    html = _push_html(*rows)
+    page = extract(html)
+    result = page.find_by_keys(["price", "title"])
+    assert result == {"price": 10, "title": "needle"}
+    stats = page.stats()
+    total_resolves = stats["resolve_cache_hits"] + stats["resolve_cache_misses"]
+    # Only chunks 0..5 (the match) should ever have been resolved -- not
+    # anywhere near all 200.
+    assert total_resolves <= 10
+
+
+# -- from_page() (Playwright integration) --------------------------------
+
+class _FakeSyncPlaywrightPage:
+    def __init__(self, html):
+        self._html = html
+
+    def content(self):
+        return self._html
+
+
+class _FakeAsyncPlaywrightPage:
+    def __init__(self, html):
+        self._html = html
+
+    async def content(self):
+        return self._html
+
+
+def test_from_page_accepts_plain_string():
+    html = _push_html('0:{"a":1}')
+    page = FlightExtractor.from_page(html)
+    assert page.resolve_chunk("0") == {"a": 1}
+
+
+def test_from_page_accepts_sync_playwright_page():
+    html = _push_html('0:{"a":1}')
+    fake_page = _FakeSyncPlaywrightPage(html)
+    page = FlightExtractor.from_page(fake_page)
+    assert page.resolve_chunk("0") == {"a": 1}
+
+
+def test_from_page_rejects_async_playwright_page_with_clear_error():
+    html = _push_html('0:{"a":1}')
+    fake_page = _FakeAsyncPlaywrightPage(html)
+    with pytest.raises(TypeError, match="async"):
+        FlightExtractor.from_page(fake_page)
+
+
+def test_from_page_forwards_strict_and_repair():
+    html = _push_html('0:{"a":1')  # truncated
+    fake_page = _FakeSyncPlaywrightPage(html)
+    page = FlightExtractor.from_page(fake_page, repair=True)
+    assert page.resolve_chunk("0") == {"a": 1}

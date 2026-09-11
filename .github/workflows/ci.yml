@@ -19,10 +19,56 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install package + test deps
+      - name: Install package + test deps (stdlib-only path)
         run: pip install -e . pytest
-      - name: Run tests
+      - name: Run tests (stdlib-only path)
         run: pytest tests/ -v
+      - name: Install optional extras (fast path) + fuzz-test deps
+        run: pip install -e ".[all]" hypothesis
+      - name: Run tests (with all optional extras installed)
+        run: pytest tests/ -v
+
+  typecheck:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + type-check deps
+        run: pip install -e ".[all]" mypy
+      - name: Run mypy
+        run: mypy src/nextflight --ignore-missing-imports
+
+  benchmark:
+    name: Benchmark regression check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: pip install -e .
+      - name: Run benchmarks
+        run: python benchmarks/run_benchmarks.py --json /tmp/current_bench.json --repeats 8
+      - name: Check for regressions vs. baseline
+        # Runners are shared/variable-speed hardware, so this is a coarse
+        # smoke check (generous 25% threshold) rather than a precise gate
+        # -- it exists to catch an accidental algorithmic regression (e.g.
+        # an O(n) path turning back into O(n^2)), not to police normal
+        # run-to-run timing noise. A real perf regression from a genuine
+        # code change should update benchmarks/baseline.json deliberately
+        # (see benchmarks/check_regression.py's docstring) rather than
+        # this check being tightened to chase CI noise.
+        run: python benchmarks/check_regression.py /tmp/current_bench.json --threshold 0.25
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-result
+          path: /tmp/current_bench.json
 
   build:
     name: Build distributions

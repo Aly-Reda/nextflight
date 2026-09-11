@@ -1,0 +1,52 @@
+{
+  "keys": [
+    "0",
+    "2",
+    "",
+    "#2"
+  ],
+  "resolve_all": {
+    "": [
+      "/a.css",
+      "style"
+    ],
+    "#2": [
+      "/b.css",
+      "style"
+    ],
+    "0": [
+      "$",
+      "div",
+      null,
+      {
+        "children": {
+          "price": 2999,
+          "title": "Product B"
+        }
+      }
+    ],
+    "2": {
+      "price": 2999,
+      "title": "Product B"
+    }
+  },
+  "stats": {
+    "chunk_count": 4,
+    "chunk_ids": [
+      "0",
+      "2",
+      "",
+      "#2"
+    ],
+    "flight_row_kind_counts": {
+      "json": 2,
+      "preload": 2
+    },
+    "html_chunk_count": 0,
+    "json_chunk_count": 4,
+    "value_type_counts": {
+      "dict": 1,
+      "list": 3
+    }
+  }
+}

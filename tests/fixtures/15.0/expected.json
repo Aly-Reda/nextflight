@@ -1,0 +1,73 @@
+{
+  "keys": [
+    "0",
+    "1",
+    "2"
+  ],
+  "resolve_all": {
+    "0": [
+      "$",
+      {
+        "__symbol__": "react.fragment"
+      },
+      null,
+      {
+        "children": [
+          [
+            "$",
+            {
+              "__symbol__": "react.suspense"
+            },
+            null,
+            {
+              "children": "Loading..."
+            }
+          ],
+          {
+            "price": 4999,
+            "tags": [
+              "a",
+              "b"
+            ],
+            "title": "Product D"
+          }
+        ]
+      }
+    ],
+    "1": [
+      "$",
+      {
+        "__symbol__": "react.suspense"
+      },
+      null,
+      {
+        "children": "Loading..."
+      }
+    ],
+    "2": {
+      "price": 4999,
+      "tags": [
+        "a",
+        "b"
+      ],
+      "title": "Product D"
+    }
+  },
+  "stats": {
+    "chunk_count": 3,
+    "chunk_ids": [
+      "0",
+      "1",
+      "2"
+    ],
+    "flight_row_kind_counts": {
+      "json": 3
+    },
+    "html_chunk_count": 0,
+    "json_chunk_count": 3,
+    "value_type_counts": {
+      "dict": 1,
+      "list": 2
+    }
+  }
+}

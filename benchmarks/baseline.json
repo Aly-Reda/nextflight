@@ -1,0 +1,29 @@
+{
+  "small": {
+    "num_chunks": 350,
+    "page_kb": 51.1,
+    "full_resolve_seconds": 0.0029981444999975793,
+    "find_by_keys_early_match_seconds": 0.0012005478750154452,
+    "repeated_resolve_chunk_seconds": 9.440300004825985e-08,
+    "chunks_resolved_for_early_match": 18,
+    "pages_per_second_full_resolve": 333.5
+  },
+  "medium": {
+    "num_chunks": 3500,
+    "page_kb": 533.6,
+    "full_resolve_seconds": 0.028140187999952104,
+    "find_by_keys_early_match_seconds": 0.012236647124979072,
+    "repeated_resolve_chunk_seconds": 9.329199997409887e-08,
+    "chunks_resolved_for_early_match": 176,
+    "pages_per_second_full_resolve": 35.5
+  },
+  "large": {
+    "num_chunks": 21000,
+    "page_kb": 3266.1,
+    "full_resolve_seconds": 0.1783888879999722,
+    "find_by_keys_early_match_seconds": 0.07292733874999158,
+    "repeated_resolve_chunk_seconds": 9.37040001645073e-08,
+    "chunks_resolved_for_early_match": 1051,
+    "pages_per_second_full_resolve": 5.6
+  }
+}

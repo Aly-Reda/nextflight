@@ -16,6 +16,7 @@ import warnings
 
 from .extractor import (
     FlightExtractor,
+    AsyncFlightExtractor,
     FlightParseError,
     extract,
     find_json_ld,
@@ -23,20 +24,25 @@ from .extractor import (
     detect_next_router,
     diff_pages,
 )
+from .postprocess import normalize_price, clean_text, parse_date
 
 __all__ = [
     "FlightExtractor",
+    "AsyncFlightExtractor",
     "FlightParseError",
     "extract",
     "find_json_ld",
     "find_next_data",
     "detect_next_router",
     "diff_pages",
+    "normalize_price",
+    "clean_text",
+    "parse_date",
     "NextFlightExtractor",  # deprecated alias, see below
     "extract_json_ld",      # deprecated alias, see below
 ]
 
-__version__ = "0.3.5"
+__version__ = "0.4.0"
 
 
 # ---------------------------------------------------------------------- #
