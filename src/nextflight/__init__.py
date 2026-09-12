@@ -21,6 +21,9 @@ from .extractor import (
     extract,
     find_json_ld,
     find_next_data,
+    find_page_props,
+    find_server_action_ids,
+    find_next_chunk_urls,
     detect_next_router,
     diff_pages,
 )
@@ -33,6 +36,9 @@ __all__ = [
     "extract",
     "find_json_ld",
     "find_next_data",
+    "find_page_props",
+    "find_server_action_ids",
+    "find_next_chunk_urls",
     "detect_next_router",
     "diff_pages",
     "normalize_price",
@@ -42,7 +48,7 @@ __all__ = [
     "extract_json_ld",      # deprecated alias, see below
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 # ---------------------------------------------------------------------- #

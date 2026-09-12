@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nextflight"
-version = "0.4.0"
+version = "0.4.1"
 description = "Extract JSON data from Next.js App Router pages: parses React Server Components (RSC) Flight payloads (self.__next_f.push) from server-rendered HTML or raw RSC fetches into clean Python dicts/lists -- for web scraping, crawling, and data extraction with Scrapy, requests, or httpx."
 readme = "README.md"
 requires-python = ">=3.9"

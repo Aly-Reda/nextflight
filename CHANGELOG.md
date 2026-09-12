@@ -1,8 +1,96 @@
 # Changelog
 
+## 0.4.1
+
+Extends 0.4.0's Scrapy integration and adds Pages Router / Server Action
+support, driven by patterns found reviewing a real production Scrapy
+project (~119 spiders scraping Next.js car-listing sites). All backward
+compatible — no changes to any existing public API.
+
+### New: Pages Router & Server Actions
+
+- `find_page_props(html)`: shortcut for the single most-repeated Pages
+  Router line seen across real scrapers —
+  `json.loads(<script id="__NEXT_DATA__">.text())['props']['pageProps']`
+  — returning `None` gracefully instead of raising on a missing or
+  malformed block.
+- `find_server_action_ids(html)`: finds Next.js Server Action ids
+  (`createServerReference("...")`) embedded in a page or JS chunk's raw
+  text, for sites that fetch data via a server action (invoked with a
+  `Next-Action: <id>` POST header) rather than a discoverable API route.
+- `find_next_chunk_urls(html, pattern=None)`: finds `/_next/static/
+  chunks/*.js` bundle URLs referenced by a page, for locating the
+  specific chunk a server action id is defined in.
+
+### New: link discovery beyond rendered HTML
+
+- `FlightExtractor.find_urls(keys=None, pattern=None)`: finds
+  URL-shaped strings in the Flight JSON itself — catches navigation for
+  sites that route via `onClick`/client-side routing rather than a real
+  `<a href>`, which Scrapy's own HTML-based `LinkExtractor` can't see.
+- `NextflightSpiderMixin.follow_flight_urls(response, keys=, pattern=,
+  callback=, **kwargs)`: Scrapy convenience wrapping the above, yielding
+  `response.follow(...)` for each result with relative URLs resolved.
+
+### New: Scrapy middleware family
+
+- `FlightRetryMiddleware`: auto-retries a response whose Flight data
+  parsed with suspiciously low `parse_confidence()` — catches
+  challenge/interstitial pages masquerading as a normal HTTP 200, which
+  status-code-based retry can't see. Uses Scrapy's own
+  `get_retry_request` helper; never retries a response with zero Flight
+  chunks. Requires Scrapy >= 2.5.
+- `NextflightStatsExtension`: surfaces parse-health metrics
+  (`nextflight/responses_with_flight_data`, `avg_parse_confidence`,
+  `version_hint/<range>`, `stream/stopped_early`) in Scrapy's own
+  end-of-crawl stats dump.
+- `.extract_as()` now also accepts a `scrapy.Item` subclass, detected
+  only if Scrapy is already installed (no new hard dependency).
+- `recommended_settings()` gained `retry=`/`stats=` flags.
+- Verified and documented: `NextflightStatsExtension`,
+  `FlightRetryMiddleware`, and `FlightStreamingMiddleware` all work
+  without `FlightMiddleware` also being enabled (they read Flight data
+  through their own internal path). Also documented, and pinned with a
+  test, that `FlightMiddleware` patches `scrapy.http.Response` at the
+  class level with no "uninstall" — once constructed once in a process,
+  `response.flight` keeps working for every response for that process's
+  remaining lifetime.
+- **Verified against actual package source** (not assumed):
+  `FlightStreamingMiddleware`'s `bytes_received`-based early-stop does
+  **not** engage for requests routed through `scrapy-zyte-api`'s
+  Addon/automap or `scrapy-impersonate` — neither routes through the
+  Twisted-based download handler that emits that signal. Documented as
+  a compatibility note in `docs/scrapy.md` so projects using either
+  aren't surprised when streaming doesn't speed those requests up.
+
+### Testing
+
+- Fixed a test-isolation bug in the Scrapy test suite discovered while
+  writing the above verification: a `Response` subclass with a custom
+  `__setattr__` override doesn't actually force the middleware's
+  fallback-cache path, since `object.__setattr__()` bypasses a
+  subclass's own `__setattr__` entirely — replaced with a genuinely
+  slot-restricted class that forces the intended path deterministically
+  on every Python/Scrapy version.
+- Fuzz-tested all new functions (`find_page_props`, `find_server_action_ids`,
+  `find_next_chunk_urls`, `find_urls`) against 500-5000 randomized/adversarial
+  inputs each (empty strings, bytes, wrong types, malformed JSON,
+  response-like objects) — zero crashes.
+- Re-ran the existing hypothesis fuzz suite at 5000 examples (up from
+  the default ~300) against the repair/parse_confidence/version_hint
+  path with no new findings.
+
+### Docs
+
+- `docs/scrapy.md` gained sections for all of the above, plus a "Wiring
+  this into an existing alerting extension" pattern for connecting
+  `parse_confidence()` to a project's existing Slack/Telegram/email
+  alerting rather than only Scrapy's own stats dump.
+
 ## 0.4.0
 
 Large release, delivered in two rounds of work, covering parsing
+
 robustness, performance, Scrapy-native ergonomics, and correctness
 hardening. All backward compatible — no changes to `extract()`,
 `FlightExtractor(html, strict=, repair=)`, `.find_all()`/`.find_one()`/
@@ -92,6 +180,60 @@ hardening. All backward compatible — no changes to `extract()`,
   `NEXTFLIGHT_REPAIR`/`NEXTFLIGHT_DEDUPE` from settings.py. Also caches
   `next_version_hint()` per domain rather than recomputing it (a full
   page-HTML marker scan) on every response of a large same-site crawl.
+- `nextflight.scrapy_middleware.FlightStreamingMiddleware` (new): opt-in
+  (`NEXTFLIGHT_STREAMING = True`) processing of a response's bytes AS
+  THEY ARRIVE, via Scrapy's `bytes_received` signal, instead of waiting
+  for the full download to complete. With `NEXTFLIGHT_STREAM_KEYS` set,
+  cancels the rest of the download the moment a match appears (via
+  `scrapy.exceptions.StopDownload`) — e.g. a 3MB page where the wanted
+  field is in the first 50KB no longer needs the other ~2.95MB
+  downloaded at all; the match is exposed as
+  `response.meta["nextflight_match"]`. Without stream keys configured,
+  still pre-warms `response.flight` from bytes decoded incrementally
+  during the download (a smaller but real win — parsing overlaps network
+  I/O instead of strictly following it). Requires Scrapy >= 2.6; disables
+  itself via `NotConfigured` on older Scrapy. Handles multi-byte UTF-8
+  characters split across arbitrary byte-chunk boundaries correctly
+  (verified with a byte-at-a-time feed test and 200 randomized
+  chunk-size fuzz trials), and correctly falls back to parsing the full
+  `response.text` if its own tracking buffer hits
+  `NEXTFLIGHT_STREAM_MAX_BYTES` before finding a match, rather than
+  silently returning a truncated result for a response that Scrapy
+  actually finished downloading in full. Supports a per-request
+  override of `NEXTFLIGHT_STREAM_KEYS` via
+  `request.meta["nextflight_stream_keys"]` for spiders crawling several
+  URL patterns that each need different fields watched for.
+- `nextflight.scrapy_middleware.FlightRSCMiddleware` (new): transparently
+  fetches a page's lightweight RSC payload (`RSC: 1` header) instead of
+  full HTML for eligible requests (opt-in per-request via
+  `meta={"nextflight_rsc": True}`, or crawl-wide via
+  `NEXTFLIGHT_RSC_URL_PATTERN`) — often a fraction of a full page's
+  size. `response.flight` works unchanged on the result via the
+  library's existing raw-RSC auto-detection.
+- `nextflight.scrapy_middleware.FlightDedupeMiddleware` (new): spider
+  middleware that deduplicates dict items across the *whole* crawl
+  (`NEXTFLIGHT_DEDUPE_ACROSS_PAGES = True`), catching duplicate listings
+  that show up on more than one page — beyond what
+  `find_all_by_keys(dedupe=True)`'s single-page dedupe can see.
+  Non-dict items (`Request` objects, typed `Item`s) always pass through
+  untouched.
+- `nextflight.scrapy_middleware.recommended_settings()` (new): a
+  starting-point settings preset (`streaming=`, `rsc=`,
+  `dedupe_across_pages=` flags) for bootstrapping a new project's
+  `nextflight` + Scrapy wiring.
+- Fixed a latent bug (present since `FlightStreamingMiddleware` was
+  added): `NotConfigured` was only importable inside a Scrapy
+  >=2.6-gated `try` block, so on older Scrapy any *other* middleware
+  raising it (`FlightDedupeMiddleware`, which has no such version
+  requirement) would raise a local fake exception class Scrapy's real
+  middleware-loading logic wouldn't recognize, crashing instead of
+  gracefully skipping the middleware. `NotConfigured` is now imported
+  unconditionally, independent of the streaming-specific availability
+  check.
+- `docs/scrapy.md` gained a "Which approach should I use?" decision
+  guide comparing every Scrapy integration option (middleware, mixin,
+  streaming, RSC, item pipeline, cross-page dedupe, plain `extract()`)
+  by when each is actually worth using.
 - `FlightItemPipeline`: declare a required key set once
   (`NEXTFLIGHT_PIPELINE_KEYS`), get every matching dict via
   `matches_for_response(response)` without repeating `find_all_by_keys`

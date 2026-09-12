@@ -1507,6 +1507,85 @@ class FlightExtractor:
             root=root, include_source=include_source,
         )
 
+    _URL_LIKE_RE = re.compile(r"^(?:https?://\S+|/[^\s\"'<>]*)$")
+
+    def find_urls(self, *, keys: Optional[Iterable[str]] = None,
+                   pattern: Optional[Any] = None, root: Any = None) -> list:
+        """Find navigable URLs sitting in the Flight JSON itself, not
+        just whatever ends up in rendered `<a href>` tags.
+
+        This matters specifically for Next.js sites: a `<Link>` component
+        almost always renders a real anchor tag (so an HTML-based link
+        extractor like Scrapy's `LinkExtractor`/`response.follow_all()`
+        already sees it) -- but plenty of common UI patterns don't use
+        `<Link>` at all: a card grid navigating via an `onClick`
+        handler and `router.push(...)`, a "load more" cursor/URL passed
+        as page data for a client-side fetch, or a "related items"
+        widget whose targets are only present as data, not markup. Those
+        URLs are real, present in the page's JSON, and invisible to
+        anything that only looks at rendered HTML.
+
+        `keys`: restrict to string values found under specifically these
+        key names (e.g. `{"href", "url", "link", "next"}`) -- much more
+        precise than scanning every string on the page, since a page can
+        easily contain URL-*shaped* strings that aren't links a crawler
+        should follow (a canonical-tag value duplicated into page data,
+        an image CDN URL, an external share-link). If omitted, scans
+        every string value on the page for anything URL-shaped
+        (absolute `http(s)://` or a root-relative `/path`), which is
+        noisier but doesn't require knowing the site's field names ahead
+        of time.
+
+        `pattern`: an additional regex (str or compiled) the URL string
+        itself must match -- e.g. `r"/product/"` to only follow product
+        detail links, ignoring navigation chrome.
+
+        Returns distinct URLs in the order first seen; relative URLs are
+        returned as-is (still relative) -- resolve them yourself (e.g.
+        `response.urljoin(url)` in Scrapy) since this method has no
+        notion of the page's own base URL.
+
+            page.find_urls(keys={"href"})
+            page.find_urls(pattern=r"^https://")          # absolute only
+            page.find_urls(keys={"next_page_url"})         # pagination cursor
+
+        See `NextflightSpiderMixin.follow_flight_urls()` for a Scrapy
+        convenience that wraps this and yields `response.follow(...)`
+        for each result directly."""
+        compiled_pattern = None
+        if pattern is not None:
+            compiled_pattern = re.compile(pattern) if isinstance(pattern, str) else pattern
+        key_set = set(keys) if keys is not None else None
+        data = self.resolve_all() if root is None else root
+        matches: list = []
+        seen: set = set()
+
+        def is_url_like(s: str) -> bool:
+            return bool(self._URL_LIKE_RE.match(s)) and s not in ("/",)
+
+        def consider(value: Any) -> None:
+            if isinstance(value, str) and value not in seen and is_url_like(value):
+                if compiled_pattern is not None and not compiled_pattern.search(value):
+                    return
+                seen.add(value)
+                matches.append(value)
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if key_set is not None:
+                        if k in key_set:
+                            consider(v)
+                    else:
+                        consider(v)
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(data)
+        return matches
+
     def find_text(self, pattern, root: Any = None) -> list:
         """Regex-search every string value in the resolved tree and return
         the distinct whole string values that contain a match (this is a
@@ -1706,12 +1785,14 @@ class FlightExtractor:
                     required_keys: Optional[Iterable[str]] = None) -> Any:
         """Find the first dict matching `required_keys` (defaulting to the
         target's own field names) and coerce it into `model` -- a stdlib
-        `dataclasses.dataclass`, or (if the optional `pydantic` extra is
-        installed) a pydantic `BaseModel`. Extra keys present in the
-        matched dict but not on `model` are ignored; missing keys that
-        have no default raise the model's own validation error, so a
-        shape mismatch fails loudly rather than silently returning a
-        half-populated object.
+        `dataclasses.dataclass`, a pydantic `BaseModel` (optional
+        `pydantic` extra), or a Scrapy `Item` subclass (detected only if
+        Scrapy is already installed -- this does not add a hard
+        dependency on Scrapy). Extra keys present in the matched dict but
+        not on `model` are ignored; missing keys that have no default
+        raise the model's own validation error, so a shape mismatch
+        fails loudly rather than silently returning a half-populated
+        object.
 
             @dataclass
             class Listing:
@@ -1719,6 +1800,13 @@ class FlightExtractor:
                 price: float
 
             listing = page.extract_as(Listing)
+
+            # Or, in a Scrapy project:
+            class ListingItem(scrapy.Item):
+                title = scrapy.Field()
+                price = scrapy.Field()
+
+            listing = page.extract_as(ListingItem)
 
         Returns `None` if no matching dict is found at all. This is a
         thin, optional convenience on top of :meth:`find_by_keys` --
@@ -1729,14 +1817,24 @@ class FlightExtractor:
         model_fields = getattr(model, "model_fields", None)
         is_pydantic = model_fields is not None
         is_dataclass = dataclasses.is_dataclass(model)
+        is_scrapy_item = False
         if not (is_pydantic or is_dataclass):
+            try:
+                import scrapy as _scrapy_pkg
+                is_scrapy_item = isinstance(model, type) and issubclass(model, _scrapy_pkg.Item)
+            except ImportError:
+                pass
+        if not (is_pydantic or is_dataclass or is_scrapy_item):
             raise TypeError(
-                f"{model!r} is neither a dataclass nor a pydantic BaseModel"
+                f"{model!r} is neither a dataclass, a pydantic BaseModel, "
+                "nor a scrapy.Item subclass"
             )
         if required_keys is None:
             if is_pydantic:
                 assert model_fields is not None
                 required_keys = list(model_fields.keys())
+            elif is_scrapy_item:
+                required_keys = list(model.fields.keys())  # type: ignore[attr-defined]
             else:
                 required_keys = [f.name for f in dataclasses.fields(model)]
         match = self.find_by_keys(required_keys, root=root)
@@ -1744,6 +1842,9 @@ class FlightExtractor:
             return None
         if is_pydantic:
             return model(**match)
+        if is_scrapy_item:
+            field_names = set(model.fields.keys())  # type: ignore[attr-defined]
+            return model(**{k: v for k, v in match.items() if k in field_names})
         field_names = {f.name for f in dataclasses.fields(model)}
         return model(**{k: v for k, v in match.items() if k in field_names})
 
@@ -1968,6 +2069,120 @@ def find_next_data(html: Any) -> Optional[dict]:
         return _json_loads(m.group(1))
     except _JSON_ERRORS:
         return None
+
+
+def find_page_props(html: Any) -> Optional[dict]:
+    """Convenience for the single most repeated line across Pages Router
+    scrapers: ``json.loads(<script id="__NEXT_DATA__">.text())['props']['pageProps']``.
+    Returns that `pageProps` dict directly, or `None` -- gracefully, not
+    via a raised exception -- if the page has no `__NEXT_DATA__` block at
+    all, or if it does but doesn't have the expected `props.pageProps`
+    shape (some Next.js pages nest data differently, e.g. under `page`
+    instead, or have an empty `props`).
+
+    This matters beyond just saving a line: the naive
+    ``json.loads(selector('#__NEXT_DATA__').text())['props']['pageProps']``
+    raises `IndexError`/`KeyError`/`json.JSONDecodeError` uncaught on any
+    page where the script tag is missing or the shape is slightly off
+    (a redirected error page, a locale variant with a different data
+    shape, a temporarily broken deploy) -- which kills that request's
+    entire `parse()` callback rather than letting the spider log a
+    warning and move on to the next request.
+
+        page_props = find_page_props(response.text)
+        if page_props is None:
+            self.logger.warning("no page data found: %s", response.url)
+            return
+        car = page_props.get("vehicleListingData")
+
+    For the full raw `__NEXT_DATA__` blob (not just `pageProps` -- e.g.
+    you also need `buildId` or `query`), use :func:`find_next_data`
+    directly instead."""
+    data = find_next_data(html)
+    if not isinstance(data, dict):
+        return None
+    props = data.get("props")
+    if not isinstance(props, dict):
+        return None
+    page_props = props.get("pageProps")
+    return page_props if isinstance(page_props, dict) else None
+
+
+_SERVER_ACTION_ID_RE = re.compile(r'createServerReference\)\("([0-9a-f]{16,64})"')
+
+
+def find_server_action_ids(html: Any) -> list:
+    """Find Next.js Server Action ids embedded in a page or JS chunk's
+    text -- the hex ids bound via `createServerReference(...)` in the
+    client bundle, which the browser later invokes with a POST request
+    carrying a `Next-Action: <id>` header instead of a normal navigation.
+    Some sites use server actions for *data fetching* (not just
+    mutations), in which case this id is the only way to make the
+    equivalent request yourself without a real browser -- there's no
+    corresponding GET endpoint to discover any other way.
+
+        action_ids = find_server_action_ids(chunk_response.text)
+        for action_id in action_ids:
+            yield scrapy.Request(
+                page_url, method="POST",
+                headers={"Next-Action": action_id},
+                body=json.dumps([...]),   # the action's expected argument shape
+                callback=self.parse_action_response,
+            )
+
+    Server actions are typically defined in a specific `/_next/static/
+    chunks/...js` bundle referenced from the page rather than in the
+    page's own HTML -- see :func:`find_next_chunk_urls` for locating that
+    bundle first. Returns distinct ids in the order found; an empty list
+    (not an error) if none are present, which is the common case for
+    pages that don't use server actions for data fetching at all.
+
+    This is deliberately a plain regex over raw text, not part of the
+    Flight/`$`-ref parsing machinery -- server action wiring lives in
+    ordinary (if minified) JavaScript source, not in a `self.__next_f.push`
+    row, so there's no row grammar to parse here."""
+    html = _coerce_html(html)
+    seen: set = set()
+    ids: list = []
+    for m in _SERVER_ACTION_ID_RE.finditer(html):
+        action_id = m.group(1)
+        if action_id not in seen:
+            seen.add(action_id)
+            ids.append(action_id)
+    return ids
+
+
+_NEXT_CHUNK_SRC_RE = re.compile(r'src="(/_next/static/chunks/[^"]+\.js)"')
+
+
+def find_next_chunk_urls(html: Any, *, pattern: Optional[Any] = None) -> list:
+    """Find `/_next/static/chunks/*.js` script URLs referenced by a page
+    -- useful for locating the specific bundle a page's server action ids
+    or other build-time-generated identifiers live in (see
+    :func:`find_server_action_ids`), since that's rarely in the page's
+    own HTML.
+
+    `pattern`: an additional regex (str or compiled) the URL itself must
+    match, e.g. a route-specific chunk naming pattern -- omit to get
+    every chunk URL referenced by the page, which is usually dozens and
+    mostly irrelevant to any one task. Returns root-relative URLs
+    (``/_next/static/...``) in the order found; resolve against the
+    page's own URL yourself (e.g. `response.urljoin(url)` in Scrapy)."""
+    html = _coerce_html(html)
+    compiled = None
+    if pattern is not None:
+        compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+    seen: set = set()
+    urls: list = []
+    for m in _NEXT_CHUNK_SRC_RE.finditer(html):
+        url = m.group(1)
+        if url in seen:
+            continue
+        if compiled is not None and not compiled.search(url):
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
 
 
 def detect_next_router(html: Any) -> str:

@@ -10,6 +10,9 @@ from nextflight import (
     FlightParseError,
     extract,
     find_json_ld,
+    find_page_props,
+    find_server_action_ids,
+    find_next_chunk_urls,
 )
 from nextflight.extractor import FlightExtractor as _FE  # same object, sanity check
 
@@ -1885,3 +1888,187 @@ def test_from_page_forwards_strict_and_repair():
     fake_page = _FakeSyncPlaywrightPage(html)
     page = FlightExtractor.from_page(fake_page, repair=True)
     assert page.resolve_chunk("0") == {"a": 1}
+
+
+def test_extract_as_scrapy_item():
+    pytest.importorskip("scrapy")
+    import scrapy
+
+    class ListingItem(scrapy.Item):
+        title = scrapy.Field()
+        price = scrapy.Field()
+
+    html = _push_html('0:{"title":"Cool","price":99,"extra":1}')
+    page = extract(html)
+    item = page.extract_as(ListingItem)
+    assert isinstance(item, ListingItem)
+    assert dict(item) == {"title": "Cool", "price": 99}
+
+
+def test_extract_as_scrapy_item_returns_none_when_no_match():
+    pytest.importorskip("scrapy")
+    import scrapy
+
+    class ListingItem(scrapy.Item):
+        title = scrapy.Field()
+        price = scrapy.Field()
+
+    page = extract(_push_html('0:{"unrelated":1}'))
+    assert page.extract_as(ListingItem) is None
+
+
+def test_extract_as_scrapy_item_with_explicit_required_keys():
+    pytest.importorskip("scrapy")
+    import scrapy
+
+    class ListingItem(scrapy.Item):
+        title = scrapy.Field()
+        price = scrapy.Field()
+        optional_field = scrapy.Field()
+
+    html = _push_html('0:{"title":"Cool","price":99}')
+    page = extract(html)
+    # Without explicit required_keys, this would look for all 3 fields
+    # (including optional_field) and fail to match -- explicit
+    # required_keys narrows the search.
+    item = page.extract_as(ListingItem, required_keys=["title", "price"])
+    assert dict(item) == {"title": "Cool", "price": 99}
+
+
+# -- find_urls() -----------------------------------------------------------
+
+def test_find_urls_scans_all_url_shaped_strings_by_default():
+    html = _push_html(
+        '0:{"href":"/product/1","image":"https://cdn.example.com/a.jpg"}',
+        '1:{"next_page_url":"https://example.com/page/2"}',
+    )
+    page = extract(html)
+    urls = page.find_urls()
+    assert "/product/1" in urls
+    assert "https://cdn.example.com/a.jpg" in urls
+    assert "https://example.com/page/2" in urls
+
+
+def test_find_urls_filters_by_key_names():
+    html = _push_html(
+        '0:{"href":"/product/1","image":"https://cdn.example.com/a.jpg"}',
+    )
+    page = extract(html)
+    assert page.find_urls(keys={"href"}) == ["/product/1"]
+
+
+def test_find_urls_filters_by_pattern():
+    html = _push_html(
+        '0:{"a":"/product/1","b":"/category/2"}',
+    )
+    page = extract(html)
+    assert page.find_urls(pattern=r"/product/") == ["/product/1"]
+
+
+def test_find_urls_deduplicates_and_preserves_order():
+    html = _push_html(
+        '0:{"a":"/x","b":"/y","c":"/x"}',
+    )
+    page = extract(html)
+    assert page.find_urls() == ["/x", "/y"]
+
+
+def test_find_urls_ignores_non_url_strings():
+    html = _push_html(
+        '0:{"title":"Not a URL","note":"just some text"}',
+    )
+    page = extract(html)
+    assert page.find_urls() == []
+
+
+def test_find_urls_ignores_bare_slash():
+    html = _push_html('0:{"a":"/"}')
+    page = extract(html)
+    assert page.find_urls() == []
+
+
+def test_find_urls_key_filter_ignores_non_string_values_under_matching_key():
+    html = _push_html('0:{"href":{"pathname":"/x"}}')
+    page = extract(html)
+    # href's value is a nested dict, not a string -- must not crash, and
+    # must not surface the dict itself as a "url".
+    assert page.find_urls(keys={"href"}) == []
+
+
+# -- find_page_props() / find_server_action_ids() / find_next_chunk_urls() --
+
+def test_find_page_props_returns_pageprops_dict():
+    html = '<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"a":1}}}</script>'
+    assert find_page_props(html) == {"a": 1}
+
+
+def test_find_page_props_returns_none_when_next_data_missing():
+    assert find_page_props("<html>no next data here</html>") is None
+
+
+def test_find_page_props_returns_none_when_props_shape_is_off():
+    html = '<script id="__NEXT_DATA__" type="application/json">{"page":"/x"}</script>'
+    assert find_page_props(html) is None
+
+
+def test_find_page_props_returns_none_when_pageprops_missing():
+    html = '<script id="__NEXT_DATA__" type="application/json">{"props":{}}</script>'
+    assert find_page_props(html) is None
+
+
+def test_find_server_action_ids_extracts_hex_id():
+    js = (
+        'blah(createServerReference)("60cabc123def4567890abcdef1234567890abcd"'
+        ',t.callServer,void 0,e.findSourceMapURL);'
+    )
+    assert find_server_action_ids(js) == ["60cabc123def4567890abcdef1234567890abcd"]
+
+
+def test_find_server_action_ids_deduplicates_and_preserves_order():
+    js = (
+        'createServerReference)("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",t.callServer);'
+        'createServerReference)("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",t.callServer);'
+        'createServerReference)("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",t.callServer);'
+    )
+    assert find_server_action_ids(js) == [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ]
+
+
+def test_find_server_action_ids_returns_empty_list_when_absent():
+    assert find_server_action_ids("<html>plain page</html>") == []
+
+
+def test_find_next_chunk_urls_finds_all_by_default():
+    html = (
+        '<script src="/_next/static/chunks/app/page-abc123.js"></script>'
+        '<script src="/_next/static/chunks/456.js"></script>'
+    )
+    urls = find_next_chunk_urls(html)
+    assert urls == [
+        "/_next/static/chunks/app/page-abc123.js",
+        "/_next/static/chunks/456.js",
+    ]
+
+
+def test_find_next_chunk_urls_filters_by_pattern():
+    html = (
+        '<script src="/_next/static/chunks/app/page-abc123.js"></script>'
+        '<script src="/_next/static/chunks/456.js"></script>'
+    )
+    assert find_next_chunk_urls(html, pattern=r"app/") == [
+        "/_next/static/chunks/app/page-abc123.js",
+    ]
+
+
+def test_find_next_chunk_urls_deduplicates():
+    html = (
+        '<script src="/_next/static/chunks/app.js"></script>'
+        '<script src="/_next/static/chunks/app.js"></script>'
+    )
+    assert find_next_chunk_urls(html) == ["/_next/static/chunks/app.js"]
+
+
+def test_find_next_chunk_urls_returns_empty_when_absent():
+    assert find_next_chunk_urls("<html>no chunks</html>") == []

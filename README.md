@@ -112,6 +112,20 @@ def parse(self, response):
     listing = response.flight.find_by_keys({"price", "title"})
 ```
 
+For very large pages, `FlightStreamingMiddleware` processes bytes as
+they download and can cancel the rest of the download the moment a
+match is found — see
+["Processing a response while it's still downloading"](docs/scrapy.md#processing-a-response-while-its-still-downloading)
+in `docs/scrapy.md`, which also covers `FlightRSCMiddleware` (fetch the
+lightweight RSC payload instead of full HTML), `FlightDedupeMiddleware`
+(dedupe listings across the whole crawl, not just within one page),
+`FlightRetryMiddleware` (auto-retry pages that parsed with suspiciously
+low confidence — often a challenge page hiding behind a normal HTTP 200),
+and `NextflightStatsExtension` (parse-health metrics in Scrapy's own
+end-of-crawl stats dump).
+See [Which approach should I use?](docs/scrapy.md#which-approach-should-i-use)
+for a decision guide across all of these.
+
 ### Fetching a URL directly (no Scrapy needed)
 
 ```python
@@ -282,10 +296,11 @@ actually salvaged with `.parse_confidence()`.
 | `.find_by_key_pattern(pattern, root=None)` | `list` | Every dict with a key matching a regex, e.g. `r"^price_"` |
 | `.find_by_type(type_value, key="@type", root=None)` | `list` | Every dict whose `key` field equals `type_value` |
 | `.find_text(pattern, root=None)` | `list` | Distinct string values matching a regex (emails, SKUs, ...) |
+| `.find_urls(keys=None, pattern=None, root=None)` | `list` | URL-shaped strings from the Flight JSON itself — catches navigation that never rendered as a real `<a href>` (client-side routing, pagination cursors) |
 | `.find_all(predicate, root=None, max_results=None)` | `list` | Fully custom predicate over every node |
 | `.find_one(predicate, root=None)` | value or `None` | Like `find_all` but just the first match |
 | `.suggest_similar_keys(required_keys)` | `dict` | When a `find_*` call comes back empty, fuzzy-match against keys actually present, e.g. `{"titl": ["title"]}` |
-| `.extract_as(Model, root=None)` | instance or `None` | Find the first dict matching `Model`'s fields and coerce it into a dataclass or pydantic model |
+| `.extract_as(Model, root=None)` | instance or `None` | Find the first dict matching `Model`'s fields and coerce it into a dataclass, pydantic model, or `scrapy.Item` |
 
 Pass `include_source=True` on any `find_*` method to get `(node,
 chunk_id)` tuples instead of bare nodes, so you can trace a match back to
@@ -324,6 +339,17 @@ identity` request.
   trying first for product/article/breadcrumb structured data.
 - **`find_next_data(html) -> dict | None`** — parse a Pages Router
   `__NEXT_DATA__` blob. `None` if the page doesn't have one.
+- **`find_page_props(html) -> dict | None`** — shortcut for the single
+  most repeated Pages Router line
+  (`json.loads(...)['props']['pageProps']`), returning `None` gracefully
+  instead of raising on a missing/malformed block.
+- **`find_server_action_ids(html) -> list`** — find Next.js Server
+  Action ids (`createServerReference("...")`) embedded in a page or JS
+  chunk's text, for sites that fetch data via a server action instead of
+  a plain API route.
+- **`find_next_chunk_urls(html, pattern=None) -> list`** — find
+  `/_next/static/chunks/*.js` bundle URLs referenced by a page, e.g. to
+  locate the chunk a server action id is defined in.
 - **`detect_next_router(html) -> str`** — `"app"`, `"pages"`, `"both"`, or
   `"unknown"`. Run this first if you're not sure which extractor to use.
 - **`diff_pages(old, new, id_key=None) -> dict`** — module-level form of
