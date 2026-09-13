@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.4.2
+
+Closes the biggest functional/correctness gaps identified in a review of
+real-world Scrapy/`requests` usage: calling (not just discovering) Server
+Actions, `/_next/image` URL handling, distinguishing bot-mitigation
+challenge pages and Vercel's deployment-protection wall from ordinary
+parse failures, session continuity for multi-step Server Action
+workflows, and a correctness fix for Flight's non-JSON value encodings.
+
+### Fixed: RSC special-value decoding (was silently wrong)
+
+- `FlightExtractor.resolve_chunk()`/`resolve_all()` previously passed
+  Flight's sigil-encoded non-JSON values through as **raw, unresolved
+  strings** — e.g. a `Date` field came back as the literal string
+  `"$D2024-01-05T00:00:00.000Z"` instead of a `datetime.datetime`. Worse,
+  the existing `$`-ref regex mis-split ISO date strings on their internal
+  colons, so this wasn't just "unresolved," it was silently malformed.
+  Now decoded automatically: `$D<isoString>` → `datetime.datetime`,
+  `$Q<ref>` (Map) → `dict`, `$W<ref>` (Set) → `list`, `$n<digits>`
+  (BigInt) → `int`.
+- **This changes what already-shipped `resolve_*` calls return** for any
+  page with a Date/Map/Set/BigInt field. Pass
+  `FlightExtractor(html, decode_rsc_values=False)` to keep the pre-0.4.2
+  raw-string behavior if existing code depends on it.
+- New golden-file fixture (`tests/fixtures/rsc-values-0.4.2/`) pins the
+  decoded output going forward.
+
+### New: Server Action invocation
+
+- `call_server_action(url, action_id, args=(), *, router_state_tree, session=None, headers=None, cookies=None)`:
+  actually *calls* a Server Action over plain HTTP and parses the
+  response — the missing counterpart to 0.4.1's
+  `find_server_action_ids()`, which only discovers ids. POSTs to the
+  page's own URL (there's no separate action endpoint) with the required
+  `Accept`/`Next-Action`/`Next-Router-State-Tree` headers set
+  automatically. Encodes `args` as a plain JSON array, or
+  `multipart/form-data` if any argument looks like a file. Works with a
+  bare stdlib request or a `requests.Session`-like `session=`.
+- `ActionNotFoundError` (a new `FlightRequestError` base class): raised
+  instead of an opaque HTTP 500 when the server no longer recognizes the
+  action id — almost always a stale id from before a redeploy.
+- `capture_router_state_tree_hint(html="")`: an explicitly-labeled,
+  best-effort fallback for the one input `call_server_action` can't
+  reliably derive from static HTML alone — a real browser capture of
+  `Next-Router-State-Tree` is still the recommended source per route.
+- `FlightSession`: wraps cookie *and* router-state-tree continuity across
+  `.get()` → `.call_action()` → `.call_action()` chains, the same role
+  `requests.Session` plays for cookies alone. Stdlib-only by default;
+  accepts a `requests.Session`-compatible `backend=` for connection
+  pooling/proxies/retries already configured on it.
+
+### New: `/_next/image` URL helpers
+
+- `resolve_next_image_url(next_image_url) -> str`: decode a
+  `/_next/image?url=...&w=...&q=...` proxy URL back to its original
+  source URL.
+- `build_next_image_url(base_url, image_url, *, width, quality=75) -> str`:
+  build a proxy URL for a specific resolution.
+- `resolve_next_image_srcset(html_or_tag) -> list[dict]`: decode every
+  candidate in an `<img srcset="...">` into `{"width", "url"}` entries.
+- All three are pure `urllib.parse` — no new dependency.
+
+### New: bot-mitigation / access-wall fingerprinting
+
+- `detect_challenge_page(response) -> str | None`: fingerprints
+  Cloudflare, Akamai, DataDome, and PerimeterX challenge/interstitial
+  pages served with an HTTP 200 — a more actionable signal than a low
+  `parse_confidence()` score alone, since it tells a retry policy *why*
+  the page looks wrong (rotate proxy/UA) rather than just *that* it does
+  (retry plainly).
+- `detect_deployment_protection(response) -> bool`: fingerprints Vercel
+  Deployment Protection's own login-wall page — the same "200 but not
+  real content" trap, checked separately since it's a distinct,
+  Vercel-specific signature rather than a general WAF product's.
+
+All backward compatible except the `decode_rsc_values` behavior change
+noted above, which is opt-out via a constructor flag.
+
 ## 0.4.1
 
 Extends 0.4.0's Scrapy integration and adds Pages Router / Server Action

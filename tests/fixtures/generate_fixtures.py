@@ -65,6 +65,20 @@ FIXTURES = {
         '1:["$","$Sreact.suspense",null,{"children":"Loading..."}]',
         '2:{"title":"Product D","price":4999,"tags":["a","b"]}',
     ),
+    # Not tied to a specific Next.js version -- exercises the v0.4.2
+    # RSC special-value decoding (item 27): $D<isoString> dates, $n<digits>
+    # BigInts, and $Q<ref>/$W<ref> Map/Set references, alongside a plain
+    # ordinary ref to confirm the surrounding resolution machinery is
+    # untouched by the new sigil handling.
+    "rsc-values-0.4.2": (
+        _push(
+            '0:{"title":"Product E","createdAt":"$D2024-01-05T00:00:00.000Z",'
+            '"views":"$n123456789012345","tags":"$W1","meta":"$Q2","related":"$3"}',
+            '1:["new","sale"]',
+            '2:[["source","scrape"],["region","eu"]]',
+            '3:{"id":42}',
+        )
+    ),
 }
 
 

@@ -17,7 +17,10 @@ import warnings
 from .extractor import (
     FlightExtractor,
     AsyncFlightExtractor,
+    FlightSession,
     FlightParseError,
+    FlightRequestError,
+    ActionNotFoundError,
     extract,
     find_json_ld,
     find_next_data,
@@ -26,13 +29,23 @@ from .extractor import (
     find_next_chunk_urls,
     detect_next_router,
     diff_pages,
+    call_server_action,
+    capture_router_state_tree_hint,
+    resolve_next_image_url,
+    build_next_image_url,
+    resolve_next_image_srcset,
+    detect_challenge_page,
+    detect_deployment_protection,
 )
 from .postprocess import normalize_price, clean_text, parse_date
 
 __all__ = [
     "FlightExtractor",
     "AsyncFlightExtractor",
+    "FlightSession",
     "FlightParseError",
+    "FlightRequestError",
+    "ActionNotFoundError",
     "extract",
     "find_json_ld",
     "find_next_data",
@@ -41,6 +54,13 @@ __all__ = [
     "find_next_chunk_urls",
     "detect_next_router",
     "diff_pages",
+    "call_server_action",
+    "capture_router_state_tree_hint",
+    "resolve_next_image_url",
+    "build_next_image_url",
+    "resolve_next_image_srcset",
+    "detect_challenge_page",
+    "detect_deployment_protection",
     "normalize_price",
     "clean_text",
     "parse_date",
@@ -48,7 +68,7 @@ __all__ = [
     "extract_json_ld",      # deprecated alias, see below
 ]
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 
 # ---------------------------------------------------------------------- #

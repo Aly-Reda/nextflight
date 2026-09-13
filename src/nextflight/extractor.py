@@ -44,10 +44,13 @@ Quick start
 
 from __future__ import annotations
 
+import datetime
 import json
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Mapping
 from inspect import iscoroutinefunction as _is_coroutine_function
 from typing import Any, Callable, Iterable, Iterator, Optional, Union
@@ -259,6 +262,44 @@ class FlightParseError(Exception):
     """Raised only when ``strict=True`` and a row cannot be parsed at all."""
 
 
+class FlightRequestError(Exception):
+    """Base class for errors raised while making a request on the
+    caller's behalf (currently: :func:`call_server_action`). Distinct
+    from :class:`FlightParseError`, which is about a row's *content*
+    being malformed, not the HTTP exchange that fetched it."""
+
+
+class ActionNotFoundError(FlightRequestError):
+    """Raised by :func:`call_server_action` when the server reports it
+    can no longer find the requested Server Action id -- almost always
+    because a redeploy regenerated action ids since this one was
+    scraped from an earlier page load. Without this, the failure
+    surfaces as an opaque 500 (or a 200 rendering a generic error
+    component) that looks identical to any other request-gone-wrong,
+    even though the fix (re-discover the id with
+    :func:`find_server_action_ids` against a fresh page) is completely
+    different from what you'd do for, say, a timeout."""
+
+
+class FlightRequestError(Exception):
+    """Base class for errors raised while making a request on the
+    caller's behalf (currently: :func:`call_server_action`). Distinct
+    from :class:`FlightParseError`, which is about a row's *content*
+    being malformed, not the HTTP exchange that fetched it."""
+
+
+class ActionNotFoundError(FlightRequestError):
+    """Raised by :func:`call_server_action` when the server reports it
+    can no longer find the requested Server Action id -- almost always
+    because a redeploy regenerated action ids since this one was
+    scraped from an earlier page load. Without this, the failure
+    surfaces as an opaque 500 (or a 200 rendering a generic error
+    component) that looks identical to any other request-gone-wrong,
+    even though the fix (re-discover the id with
+    :func:`find_server_action_ids` against a fresh page) is completely
+    different from what you'd do for, say, a timeout."""
+
+
 class _LazyRawChunks(Mapping):
     """Dict-like view over a page's chunks that decodes each chunk's raw
     JSON lazily, on first access, rather than all up front at parse time.
@@ -389,6 +430,15 @@ class FlightExtractor:
         to forbid); combining both raises `ValueError`. Has no effect on
         already-well-formed payloads. See :meth:`parse_confidence` to
         check how much of a repaired page was actually salvaged.
+    decode_rsc_values:
+        If True (the default), decode Flight's sigil-prefixed value
+        encodings for types plain JSON can't represent -- currently
+        `$D<isoString>` (``datetime.datetime``), `$Q<ref>` (``Map`` ->
+        `dict`), and `$W<ref>` (``Set`` -> `list`) -- into native Python
+        values wherever they appear, instead of leaving them as raw
+        strings like ``"$D2024-01-05T00:00:00.000Z"``. Set to False to
+        get the pre-0.4.2 behavior back (raw sigil strings passed
+        through unresolved) if existing code depends on the old shape.
     """
 
     _REF_RE = re.compile(r"^\$(?P<sigil>[A-Z@]{0,2})(?P<id>[^:\s]+)(?::(?P<path>.+))?$")
@@ -398,7 +448,8 @@ class FlightExtractor:
     _HTML_TAG_RE = re.compile(r"<[a-zA-Z!/][^>\n]{0,300}>")
     _RAW_RSC_ROW_RE = re.compile(r"^[0-9a-zA-Z_\-]+:")
 
-    def __init__(self, html: Any, *, strict: bool = False, repair: bool = False):
+    def __init__(self, html: Any, *, strict: bool = False, repair: bool = False,
+                 decode_rsc_values: bool = True):
         if strict and repair:
             raise ValueError(
                 "strict=True and repair=True are mutually exclusive: "
@@ -408,6 +459,7 @@ class FlightExtractor:
         self.html = _coerce_html(html)
         self.strict = strict
         self.repair = repair
+        self.decode_rsc_values = decode_rsc_values
         # Populated by `_materialize_chunk` when `repair=True` salvages (or
         # fails to salvage) a chunk -- see `parse_confidence()`.
         self._repair_outcomes: dict[str, bool] = {}
@@ -1191,12 +1243,52 @@ class FlightExtractor:
             return s
         if s.startswith("$$"):  # escaped literal '$...'
             return s[1:]
+        if self.decode_rsc_values:
+            # These two sigils encode the *entire* value inline after the
+            # sigil letter (an ISO date string, a decimal digit string) --
+            # they are NOT chunk references at all, unlike every other
+            # sigil handled below. That matters because `_REF_RE`'s `id`
+            # group stops at the first ':', and an ISO date string
+            # (`2024-01-05T00:00:00.000Z`) contains one -- matching against
+            # `_REF_RE` first would misparse the date into a bogus
+            # "ref_id:path" split instead of decoding it. So these are
+            # checked, and consumed, before `_REF_RE` ever sees the string.
+            if s.startswith("$D"):
+                return self._parse_rsc_date(s[2:])
+            if s.startswith("$n"):
+                try:
+                    return int(s[2:])
+                except ValueError:
+                    pass  # not actually a BigInt -- fall through below
         m = self._REF_RE.match(s)
         if not m:
             return s
         sigil, ref_id, path = m.group("sigil"), m.group("id"), m.group("path")
         if sigil == "S":
             return {"__symbol__": ref_id}
+        if self.decode_rsc_values and sigil in ("Q", "W") and not path:
+            # "$Q<ref>" -> Map, "$W<ref>" -> Set. The referenced chunk is a
+            # plain array (of [key, value] pairs for a Map, of values for
+            # a Set) -- resolve it exactly like an ordinary reference, then
+            # convert the result into the native container the sigil
+            # denotes: a `dict` for Map, a `list` for Set (per the RSC
+            # decoding policy documented on `FlightExtractor.__init__`).
+            # Only handled when there's no trailing path segment: a
+            # path-addressed ref (rare for these two sigils in practice)
+            # is almost certainly reaching *into* the raw pairs/values
+            # array rather than asking for the wrapped container, so it's
+            # left to the generic path below instead of being converted.
+            if ref_id not in self.raw_chunks:
+                return s
+            if ref_id in self._resolving:
+                return {} if sigil == "Q" else []  # genuine cycle -- bail safely
+            items = self.resolve_chunk(ref_id)
+            if sigil == "Q":
+                try:
+                    return dict(items)
+                except (TypeError, ValueError):
+                    return items  # didn't look like [key, value] pairs after all
+            return list(items) if isinstance(items, (list, tuple)) else items
         if sigil == "@":
             # Async/Suspense placeholder marker (e.g. "$@5"): during
             # streaming, this slot's real value arrives on a later chunk
@@ -1239,6 +1331,22 @@ class FlightExtractor:
         if path:
             value = self._walk_path(value, path.split(":"))
         return value
+
+    @staticmethod
+    def _parse_rsc_date(date_str: str) -> Any:
+        """Parse an RSC-encoded `$D<isoString>` date value into a native
+        `datetime.datetime`. Accepts a trailing 'Z' (UTC) the way
+        `datetime.fromisoformat` alone doesn't on Python versions before
+        3.11, by swapping it for an explicit `+00:00` offset first.
+        Falls back to returning the original sigil-prefixed string
+        unchanged if `date_str` doesn't actually parse as a date --
+        better to surface an obviously-still-encoded value than raise an
+        exception out of an otherwise-successful page parse."""
+        normalized = date_str[:-1] + "+00:00" if date_str.endswith("Z") else date_str
+        try:
+            return datetime.datetime.fromisoformat(normalized)
+        except ValueError:
+            return f"$D{date_str}"
 
     @staticmethod
     def _walk_path(value: Any, parts: list, default: Any = None) -> Any:
@@ -2293,4 +2401,406 @@ def extract(html: Any, *, strict: bool = False) -> FlightExtractor:
     `requests.Response`, etc.) -- you can pass `response` straight from a
     Scrapy `parse()` method without writing `response.text` yourself."""
     return FlightExtractor(html, strict=strict)
+
+
+# ------------------------------------------------------------------------ #
+# `/_next/image` URL helpers
+# ------------------------------------------------------------------------ #
+
+def resolve_next_image_url(next_image_url: str) -> str:
+    """Decode a Next.js `/_next/image?url=...&w=...&q=...` image-optimizer
+    proxy URL back to the original source URL it's serving a resized copy
+    of. Handles both a root-relative source (`url=%2Fphotos%2F1.jpg`) and
+    an absolute one (`url=https%3A%2F%2Fcdn.example.com%2F1.jpg`) --
+    resolve the (possibly root-relative) result against the page's own
+    URL yourself if you need an absolute one (e.g. `response.urljoin(...)`
+    in Scrapy). Pure `urllib.parse` -- no new dependency.
+
+    Raises `ValueError` if `next_image_url` has no `url` query parameter
+    at all, which usually means it's already an original, un-proxied
+    image URL rather than a `/_next/image` link."""
+    parsed = urllib.parse.urlsplit(next_image_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    if "url" not in params or not params["url"]:
+        raise ValueError(
+            f"{next_image_url!r} doesn't look like a Next.js /_next/image "
+            "proxy URL -- no 'url' query parameter found."
+        )
+    return params["url"][0]
+
+
+def build_next_image_url(base_url: str, image_url: str, *, width: int, quality: int = 75) -> str:
+    """Build a Next.js `/_next/image?url=...&w=...&q=...` proxy URL for a
+    specific width/quality, for cases where a scraper wants a particular
+    resolution rather than whatever size happened to render on the page
+    it found `image_url` on. `base_url` is the site's own origin (e.g.
+    `"https://example.com"`, no trailing slash required); `image_url` is
+    the original source image URL (root-relative or absolute) to request
+    a resized copy of.
+
+    The result round-trips through :func:`resolve_next_image_url` back to
+    `image_url` exactly, since both use `urllib.parse`'s matching
+    encode/decode pair under the hood."""
+    query = urllib.parse.urlencode({"url": image_url, "w": width, "q": quality})
+    return f"{base_url.rstrip('/')}/_next/image?{query}"
+
+
+def resolve_next_image_srcset(html_or_tag: Any) -> list:
+    """Parse an `<img srcset="...">` (or a bare `srcset` attribute value)
+    into `{"width": int, "url": str}` entries, decoding each candidate
+    through :func:`resolve_next_image_url` -- Next.js's `<Image>`
+    component typically emits several resolutions in one `srcSet`, and
+    :func:`resolve_next_image_url` alone only handles one URL at a time.
+    Non-`/_next/image` candidates in the set (rare, but possible with a
+    custom loader) are skipped rather than raising. Accepts either a full
+    HTML fragment/page (the first `srcset="..."` found is used) or a bare
+    `srcset` attribute value string directly."""
+    html = _coerce_html(html_or_tag) if not isinstance(html_or_tag, str) else html_or_tag
+    m = re.search(r'srcset="([^"]+)"', html) if "srcset=" in html else None
+    srcset = m.group(1) if m else html
+    entries = []
+    for candidate in srcset.split(","):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        parts = candidate.split()
+        url = parts[0]
+        width = None
+        if len(parts) > 1 and parts[1].endswith("w"):
+            try:
+                width = int(parts[1][:-1])
+            except ValueError:
+                width = None
+        try:
+            resolved = resolve_next_image_url(urllib.parse.unquote(url) if "&amp;" not in url
+                                               else resolve_next_image_url(url.replace("&amp;", "&")))
+        except ValueError:
+            continue
+        entries.append({"width": width, "url": resolved})
+    return entries
+
+
+# ------------------------------------------------------------------------ #
+# Bot-mitigation / access-wall fingerprinting
+# ------------------------------------------------------------------------ #
+
+_CHALLENGE_FINGERPRINTS = (
+    ("cloudflare", re.compile(
+        r"cf-browser-verification|Attention Required! \| Cloudflare|"
+        r"cf-chl-|Just a moment\.\.\.|__cf_chl_", re.I)),
+    ("akamai", re.compile(r"akamai(?:ghost|-bot-manager)|_abck=|ak_bmsc", re.I)),
+    ("datadome", re.compile(r"datadome|dd_cookie_test_|geo\.captcha-delivery\.com", re.I)),
+    ("perimeterx", re.compile(r"_px3=|perimeterx|px-captcha", re.I)),
+)
+
+
+def detect_challenge_page(response: Any) -> Optional[str]:
+    """Best-effort fingerprint check for a bot-mitigation "challenge"
+    page (Cloudflare, Akamai, DataDome, PerimeterX) served with an HTTP
+    200 status -- the request technically "succeeded" but the body is an
+    interstitial/CAPTCHA page, not real site content.
+
+    This is a different signal from a low `parse_confidence()` score:
+    confidence only tells you the page *isn't* well-formed Flight data,
+    not *why* -- a genuinely truncated response and a deliberate block
+    both score low, but call for opposite reactions (retry plainly vs.
+    rotate proxy/User-Agent). Wire this into `FlightRetryMiddleware` (or
+    a spider's own `process_response`) to tell the two apart.
+
+    `response` accepts a raw HTML string/bytes, or a response-like object
+    (checked for both `.headers` and body text when available -- some
+    challenge vendors set a fingerprintable header even when the body
+    itself is truncated). Returns a short vendor label or `None`; `None`
+    does not guarantee the page is legitimate, only that it didn't match
+    a signature this function currently checks for."""
+    html = _coerce_html(response)
+    headers = getattr(response, "headers", None)
+    header_blob = ""
+    if headers is not None:
+        try:
+            header_blob = " ".join(f"{k}:{v}" for k, v in dict(headers).items())
+        except Exception:
+            header_blob = str(headers)
+    haystack = html[:20000] + " " + header_blob
+    for vendor, pattern in _CHALLENGE_FINGERPRINTS:
+        if pattern.search(haystack):
+            return vendor
+    return None
+
+
+_VERCEL_PROTECTION_RE = re.compile(
+    r"_vercel_sso_nonce|vercel\.com/sso-api|Vercel Authentication|"
+    r"Authentication Required[\s\S]{0,200}Vercel",
+    re.I,
+)
+
+
+def detect_deployment_protection(response: Any) -> bool:
+    """Fingerprint check for Vercel Deployment Protection's login-wall
+    page -- a preview (or protected production) deployment sitting behind
+    Vercel's own auth gate returns an HTTP 200 whose body is a generic
+    "Authentication Required" page, easy to silently misread as "the page
+    was just mostly empty" rather than "we were blocked before reaching
+    the app at all." Same spirit as :func:`detect_challenge_page` but
+    checked separately since it's a distinct, Vercel-specific signature
+    rather than a general-purpose WAF product's."""
+    html = _coerce_html(response)
+    return bool(_VERCEL_PROTECTION_RE.search(html[:20000]))
+
+
+# ------------------------------------------------------------------------ #
+# Server Action invocation
+# ------------------------------------------------------------------------ #
+
+def _is_file_like(value: Any) -> bool:
+    return hasattr(value, "read") and callable(getattr(value, "read"))
+
+
+def _encode_action_args(args: list) -> tuple:
+    """Return `(body_bytes, content_type)` for POSTing Server Action
+    arguments the way React's own client runtime does: a plain JSON
+    array (`Content-Type: text/plain;charset=UTF-8`) when every argument
+    is JSON-serializable, or `multipart/form-data` (one part per
+    argument, synthetic field names `"0"`, `"1"`, ...) when any argument
+    is a file/Blob-like object (anything with a `.read()` method)."""
+    if not any(_is_file_like(a) for a in args):
+        try:
+            return _json_dumps(list(args)).encode("utf-8"), "text/plain;charset=UTF-8"
+        except TypeError:
+            pass  # some arg isn't JSON-serializable either -- fall through
+    boundary = uuid.uuid4().hex
+    chunks = []
+    for i, arg in enumerate(args):
+        name = str(i)
+        if _is_file_like(arg):
+            filename = getattr(arg, "name", f"blob{i}")
+            data = arg.read()
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            chunks.append(
+                (f'--{boundary}\r\n'
+                 f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                 f'Content-Type: application/octet-stream\r\n\r\n').encode("utf-8")
+                + data + b"\r\n"
+            )
+        else:
+            value = arg if isinstance(arg, str) else _json_dumps(arg)
+            chunks.append(
+                (f'--{boundary}\r\n'
+                 f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                 f'{value}\r\n').encode("utf-8")
+            )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def capture_router_state_tree_hint(html: Any = "") -> str:
+    """Best-effort guess at a page's `Next-Router-State-Tree` header
+    value, for use with :func:`call_server_action` when no real
+    browser-captured header is available for the route.
+
+    **This is unreliable and deliberately just a fallback, not a real
+    solution.** The actual router state tree encodes the full parallel-
+    route segment tree as seen by a real browser session -- including any
+    `@slot` structure, dynamic segment values, and loading/error boundary
+    markers -- and there is no general way to reconstruct that from
+    static HTML alone. Next.js may reject a mismatched tree (surfacing as
+    `ActionNotFoundError` or a stale/incorrect render) even when the
+    action id itself is perfectly valid. For anything beyond the
+    simplest single-segment route, capture the real header once from a
+    browser's Network tab per distinct route shape and pass it explicitly
+    via `router_state_tree=` instead of relying on this.
+
+    Returns a JSON-encoded string for the simplest possible route shape
+    (a single root segment, no active children) -- correct for that case
+    and nothing more elaborate. `html` is currently unused (reserved for
+    a future, smarter heuristic) but accepted so call sites can pass a
+    page's HTML now and benefit later without an API change."""
+    return json.dumps(["", {}, None, None, True])
+
+
+def call_server_action(url: str, action_id: str, args: Iterable = (), *,
+                        router_state_tree: str, session: Any = None,
+                        headers: Optional[dict] = None, cookies: Optional[dict] = None,
+                        timeout: float = 15.0, strict: bool = False) -> FlightExtractor:
+    """Invoke a Next.js Server Action over plain HTTP and parse the
+    response -- the missing counterpart to `find_server_action_ids()`,
+    which only *discovers* an action id, not calls it.
+
+    Posts to `url`, which must be **the page's own URL** -- there is no
+    separate action-invocation endpoint in Next.js, the framework
+    dispatches based on the `Next-Action` request header alone. This is
+    the single most common mistake when calling this function by hand.
+
+    `args` is encoded the way React's client runtime encodes them (see
+    `_encode_action_args`): a JSON array when everything in it is plain
+    JSON-serializable data, or `multipart/form-data` if anything looks
+    like a file (has a `.read()` method).
+
+    `router_state_tree` is required and cannot generally be derived from
+    HTML alone -- it's the router's current segment tree as a real
+    browser sees it. Capture it once per distinct route shape from a
+    browser's Network tab (look for the `Next-Router-State-Tree` request
+    header on any client-side navigation), or pass the output of
+    `capture_router_state_tree_hint()` as an explicitly-labeled,
+    unreliable best-effort fallback.
+
+    `session`, if given, is any object exposing a `requests.Session`-
+    compatible `.post(url, data=, headers=, cookies=, timeout=)` method
+    returning a response with `.text` (and, ideally, `.status_code`).
+    When omitted (the default), the request is made with the stdlib
+    (`urllib.request`) instead -- no hard dependency on `requests`.
+
+    The response may contain both the action's own direct return value
+    and a revalidated render (from `revalidatePath`/`revalidateTag`
+    inside the action) as separate chunks in the same payload -- both
+    are present in the returned `FlightExtractor` (e.g. via
+    `.resolve_all()`), not just one.
+
+    Raises `ActionNotFoundError` (a `FlightRequestError` subclass) if the
+    server reports it can't find `action_id` -- almost always because a
+    redeploy regenerated action ids since this one was scraped from an
+    earlier page load; re-run `find_server_action_ids()` against a fresh
+    page to get a current id."""
+    body, content_type = _encode_action_args(list(args))
+    req_headers = {
+        "Accept": "text/x-component",
+        "Next-Action": action_id,
+        "Next-Router-State-Tree": urllib.parse.quote(router_state_tree),
+        "Content-Type": content_type,
+    }
+    if headers:
+        req_headers.update(headers)
+
+    status = None
+    if session is not None:
+        resp = session.post(url, data=body, headers=req_headers, cookies=cookies, timeout=timeout)
+        text = resp.text
+        status = getattr(resp, "status_code", None)
+    else:
+        request = urllib.request.Request(url, data=body, headers=req_headers, method="POST")
+        if cookies:
+            request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as resp_obj:
+                text = _read_urllib_response_text(resp_obj)
+                status = resp_obj.status
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", errors="replace")
+            status = e.code
+
+    if "Failed to find Server Action" in text:
+        raise ActionNotFoundError(
+            f"Server Action {action_id!r} was not found at {url!r} "
+            f"(HTTP {status}). This almost always means a redeploy "
+            "regenerated action ids since this one was scraped -- "
+            "re-discover a current id with find_server_action_ids() "
+            "against a fresh copy of the page."
+        )
+    return FlightExtractor(text, strict=strict)
+
+
+class FlightSession:
+    """Thin session wrapper for chasing Next.js Server Actions across
+    multiple requests -- the same role `requests.Session` plays for
+    cookies, but for `Next-Router-State-Tree` continuity instead.
+
+    `call_server_action()` (module-level) handles one isolated call.
+    Real multi-step workflows (load a listing page, then call its
+    "load more" action, then call it again with the next cursor) need
+    cookies *and* the router state tree carried forward automatically
+    instead of the caller manually threading both through spider
+    instance attributes or script-level globals::
+
+        session = FlightSession()
+        page = session.get("https://example.com/listings")
+        next_page = session.call_action(
+            "https://example.com/listings", action_id, [cursor],
+        )
+
+    `.get()` remembers the (best-effort) router state tree per route
+    automatically after each call, via `capture_router_state_tree_hint()`
+    -- see that function's docstring for why this is a *best-effort*
+    fallback, not a guarantee. Pass `router_state_tree=` explicitly to
+    `.call_action()` to override it with a real, browser-captured value
+    whenever accuracy matters.
+
+    By default this uses only the stdlib (`urllib.request` + a
+    `http.cookiejar.CookieJar` for cookie persistence) -- no `requests`
+    dependency required. Pass `backend=` a `requests.Session` (or
+    anything duck-typing its `.get()`/`.post()` interface) to use that
+    instead, e.g. for connection pooling, retries, or proxy support
+    already configured on it."""
+
+    def __init__(self, *, backend: Any = None, headers: Optional[dict] = None,
+                 timeout: float = 15.0, strict: bool = False) -> None:
+        self._backend = backend
+        self._cookiejar = None
+        self._opener = None
+        if backend is None:
+            import http.cookiejar
+            self._cookiejar = http.cookiejar.CookieJar()
+            self._opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(self._cookiejar)
+            )
+        self.headers = headers or {
+            "User-Agent": "Mozilla/5.0 (nextflight)",
+            "Accept-Encoding": "identity",
+        }
+        self.timeout = timeout
+        self.strict = strict
+        self._router_state_trees: dict = {}
+
+    @staticmethod
+    def _route_key(url: str) -> str:
+        return urllib.parse.urlsplit(url).path or "/"
+
+    def _cookies_dict(self) -> Optional[dict]:
+        if self._cookiejar is None:
+            return None
+        return {c.name: c.value for c in self._cookiejar}
+
+    def get(self, url: str, *, headers: Optional[dict] = None) -> FlightExtractor:
+        """GET `url`, parse it, and remember a best-effort router-state-
+        tree hint for its route for a later `.call_action()`. Cookies set
+        on the response are retained for subsequent calls on this
+        session, same as `requests.Session`."""
+        req_headers = dict(self.headers)
+        if headers:
+            req_headers.update(headers)
+        if self._backend is not None:
+            resp = self._backend.get(url, headers=req_headers, timeout=self.timeout)
+            text = resp.text
+        else:
+            request = urllib.request.Request(url, headers=req_headers)
+            with self._opener.open(request, timeout=self.timeout) as resp_obj:
+                text = _read_urllib_response_text(resp_obj)
+        self._router_state_trees[self._route_key(url)] = capture_router_state_tree_hint(text)
+        return FlightExtractor(text, strict=self.strict)
+
+    def call_action(self, url: str, action_id: str, args: Iterable = (), *,
+                     router_state_tree: Optional[str] = None,
+                     headers: Optional[dict] = None) -> FlightExtractor:
+        """Call a Server Action at `url`, reusing this session's cookies
+        and (unless overridden) its remembered router-state-tree hint for
+        that route -- see :func:`call_server_action` for the underlying
+        request semantics. Pass `router_state_tree=` explicitly with a
+        real, browser-captured value whenever the best-effort hint isn't
+        good enough for the target route's shape."""
+        tree = (
+            router_state_tree
+            or self._router_state_trees.get(self._route_key(url))
+            or capture_router_state_tree_hint()
+        )
+        result = call_server_action(
+            url, action_id, args,
+            router_state_tree=tree,
+            session=self._backend,
+            headers={**self.headers, **(headers or {})},
+            cookies=self._cookies_dict(),
+            timeout=self.timeout,
+            strict=self.strict,
+        )
+        self._router_state_trees[self._route_key(url)] = tree
+        return result
 

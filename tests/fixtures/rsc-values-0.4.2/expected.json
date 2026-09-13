@@ -1,0 +1,61 @@
+{
+  "keys": [
+    "0",
+    "1",
+    "2",
+    "3"
+  ],
+  "resolve_all": {
+    "0": {
+      "createdAt": "2024-01-05 00:00:00+00:00",
+      "meta": {
+        "region": "eu",
+        "source": "scrape"
+      },
+      "related": {
+        "id": 42
+      },
+      "tags": [
+        "new",
+        "sale"
+      ],
+      "title": "Product E",
+      "views": 123456789012345
+    },
+    "1": [
+      "new",
+      "sale"
+    ],
+    "2": [
+      [
+        "source",
+        "scrape"
+      ],
+      [
+        "region",
+        "eu"
+      ]
+    ],
+    "3": {
+      "id": 42
+    }
+  },
+  "stats": {
+    "chunk_count": 4,
+    "chunk_ids": [
+      "0",
+      "1",
+      "2",
+      "3"
+    ],
+    "flight_row_kind_counts": {
+      "json": 4
+    },
+    "html_chunk_count": 0,
+    "json_chunk_count": 4,
+    "value_type_counts": {
+      "dict": 2,
+      "list": 2
+    }
+  }
+}

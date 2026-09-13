@@ -34,7 +34,7 @@ __NEXT_DATA__ / Flight payload"* — this is that tool.
 
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Usage](#usage) — [Scrapy](#in-a-scrapy-spider), [fetching a URL](#fetching-a-url-directly-no-scrapy-needed), [raw RSC fetches](#raw-rsc-fetches-no-html-at-all), [Pages Router](#pages-router-support), [monitoring/diffing](#monitoring-a-page-over-time), [CSV/DataFrame export](#exporting-to-a-dataframe-or-csv), [CLI](#command-line)
+- [Usage](#usage) — [Scrapy](#in-a-scrapy-spider), [fetching a URL](#fetching-a-url-directly-no-scrapy-needed), [raw RSC fetches](#raw-rsc-fetches-no-html-at-all), [Server Actions](#calling-a-server-action), [Pages Router](#pages-router-support), [monitoring/diffing](#monitoring-a-page-over-time), [CSV/DataFrame export](#exporting-to-a-dataframe-or-csv), [CLI](#command-line)
 - [API reference](#api-reference)
 - [Performance](#performance)
 - [Optional dependencies](#optional-dependencies)
@@ -169,6 +169,52 @@ from a real browser's network tab and reuse it — it's stable for every
 request to the *same route* regardless of query params, so it doesn't
 need to be regenerated per request.
 
+### Calling a Server Action
+
+`find_server_action_ids()` only *discovers* an action id — calling one
+is a POST to **the page's own URL** (there is no separate action
+endpoint) with a `Next-Action` header:
+
+```python
+from nextflight import call_server_action, find_server_action_ids
+
+action_id = find_server_action_ids(page_html)[0]
+
+result = call_server_action(
+    "https://example.com/listings",     # the page's own URL, not an /api/ route
+    action_id,
+    [{"cursor": "abc123"}],              # positional args, JSON-encoded like React does
+    router_state_tree='["",{},null,null,true]',  # captured once from a browser Network tab
+)
+next_page = result.resolve_chunk("0")
+```
+
+A stale `action_id` from before a redeploy raises `ActionNotFoundError`
+(a `FlightRequestError`) instead of an opaque HTTP 500 — catch it and
+re-run `find_server_action_ids()` against a fresh page load. No real
+browser capture of `Next-Router-State-Tree` on hand yet?
+`capture_router_state_tree_hint()` provides an explicitly-unreliable
+fallback that's enough to get a workflow running for the simplest route
+shapes.
+
+For a multi-step workflow (list page → paginate via action → paginate
+again), `FlightSession` carries cookies *and* the router-state-tree
+forward automatically, the same way `requests.Session` carries cookies:
+
+```python
+from nextflight import FlightSession
+
+session = FlightSession()
+page = session.get("https://example.com/listings")
+next_page = session.call_action(
+    "https://example.com/listings", action_id, [{"cursor": "abc123"}],
+)
+```
+
+Pass `backend=requests.Session()` to `FlightSession(...)` to use
+`requests` instead of the stdlib default (useful for connection pooling,
+retries, or proxies already configured on it).
+
 ### Pages Router support
 
 Older or mixed Next.js deployments use the Pages Router's `__NEXT_DATA__`
@@ -244,7 +290,7 @@ Shorthand constructor. `html` accepts a plain string, bytes, or a
 response-like object (Scrapy's `Response`, `requests.Response`, etc.) —
 pass `response` straight from a `parse()` method.
 
-### `FlightExtractor(html, *, strict=False, repair=False)`
+### `FlightExtractor(html, *, strict=False, repair=False, decode_rsc_values=True)`
 
 `strict=True` raises `FlightParseError` on a row that's neither valid
 JSON nor a recognizable `$`-reference, instead of keeping it as a raw
@@ -258,6 +304,16 @@ closes unbalanced brackets/quotes and retries the decode, so a page with
 one truncated chunk doesn't lose that chunk's data entirely. Mutually
 exclusive with `strict=True`. Check how much of a repaired page was
 actually salvaged with `.parse_confidence()`.
+
+`decode_rsc_values=True` (the default, **new in 0.4.2**) decodes Flight's
+sigil-prefixed value encodings for types plain JSON can't represent —
+`$D<isoString>` dates into `datetime.datetime`, `$Q<ref>` Maps into
+`dict`, and `$W<ref>` Sets into `list` — instead of leaving them as raw
+strings like `"$D2024-01-05T00:00:00.000Z"`. **This changes what
+`resolve_chunk()`/`resolve_all()` return** for any page whose data
+contains a `Date`, `Map`, or `Set` field — if you were previously working
+around the raw-string encoding yourself, either update that code or pass
+`decode_rsc_values=False` to keep the old behavior.
 
 **Exploring a page**
 
@@ -322,6 +378,14 @@ resolve chunks after a match is already found.
 responses even if the server ignores the default `Accept-Encoding:
 identity` request.
 
+**Server Actions and sessions** — see "Calling a Server Action" above.
+
+| Function/class | What it does |
+|---|---|
+| `call_server_action(url, action_id, args=(), *, router_state_tree, ...) -> FlightExtractor` | Invoke a Server Action and parse the response. Raises `ActionNotFoundError` on a stale id |
+| `FlightSession(backend=None, headers=None, timeout=15.0)` | `.get(url)` / `.call_action(url, action_id, args)` — carries cookies and a best-effort router-state-tree across calls, stdlib-only by default |
+| `capture_router_state_tree_hint(html="")` | Explicitly-unreliable fallback for `router_state_tree=` when no real browser capture is available |
+
 **Diffing and exporting**
 
 | Method | Returns | What it does |
@@ -354,6 +418,38 @@ identity` request.
   `"unknown"`. Run this first if you're not sure which extractor to use.
 - **`diff_pages(old, new, id_key=None) -> dict`** — module-level form of
   `.diff()`.
+- **`call_server_action(url, action_id, args=(), *, router_state_tree, session=None, headers=None, cookies=None, timeout=15.0) -> FlightExtractor`**
+  — **new in 0.4.2.** Invoke a Next.js Server Action over plain HTTP and
+  parse the response. `url` must be the page's own URL — there is no
+  separate action-invocation endpoint. Raises `ActionNotFoundError` (a
+  `FlightRequestError`) instead of an opaque HTTP 500 when the server no
+  longer recognizes `action_id` (almost always a stale id from before a
+  redeploy). See "Calling a Server Action" below.
+- **`capture_router_state_tree_hint(html="") -> str`** — **new in 0.4.2.**
+  Best-effort, explicitly-unreliable fallback for the
+  `Next-Router-State-Tree` value `call_server_action()` needs, for when
+  no real browser-captured header is available. Correct only for the
+  simplest single-segment route shape.
+- **`resolve_next_image_url(next_image_url) -> str`** — **new in 0.4.2.**
+  Decode a `/_next/image?url=...&w=...&q=...` proxy URL back to the
+  original source URL. Raises `ValueError` if there's no `url` query
+  parameter to decode.
+- **`build_next_image_url(base_url, image_url, *, width, quality=75) -> str`**
+  — **new in 0.4.2.** Build a `/_next/image` proxy URL for a specific
+  resolution, for when a scraper wants a size other than whatever
+  happened to render on the page it found the image on.
+- **`resolve_next_image_srcset(html_or_tag) -> list[dict]`** — **new in
+  0.4.2.** Decode every candidate in an `<img srcset="...">` (or a bare
+  `srcset` value) into `{"width": int, "url": str}` entries.
+- **`detect_challenge_page(response) -> str | None`** — **new in 0.4.2.**
+  Fingerprint check for a Cloudflare/Akamai/DataDome/PerimeterX
+  bot-mitigation interstitial served with an HTTP 200 — a different, more
+  actionable signal than a low `parse_confidence()` score, since it tells
+  you *why* the page looks wrong. Returns a vendor label or `None`.
+- **`detect_deployment_protection(response) -> bool`** — **new in 0.4.2.**
+  Fingerprint check for Vercel Deployment Protection's own login-wall
+  page — same "200 but not real content" problem as
+  `detect_challenge_page`, checked separately since it's Vercel-specific.
 - **`normalize_price(value) -> dict | None`** — parse a messy price string
   (currency symbols, thousands separators, either comma or period as the
   decimal point) into `{"amount": float, "currency": str | None}`.

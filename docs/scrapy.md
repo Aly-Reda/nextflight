@@ -342,6 +342,75 @@ some domains need anti-bot handling and others don't), streaming still
 helps the plain-HTTP subset — there's no need to disable it project-wide
 just because some spiders use one of these.
 
+## Calling a Server Action from a spider callback
+
+`find_server_action_ids()` (0.4.1) only *discovers* an action id.
+`call_server_action()` (0.4.2) actually invokes one — useful for sites
+that paginate or fetch data via a Server Action rather than a plain
+`?page=2` URL or a discoverable `/api/...` route. Because
+`call_server_action()` makes its own HTTP request rather than returning
+a `scrapy.Request` for the scheduler to dispatch, the simplest pattern is
+calling it inline inside a callback and yielding items/requests from its
+result directly:
+
+```python
+from nextflight import call_server_action, find_server_action_ids, ActionNotFoundError
+
+class ListingSpider(scrapy.Spider):
+    name = "listings"
+
+    def parse(self, response):
+        yield from response.flight.find_all_by_keys({"price", "title"})
+
+        action_id = find_server_action_ids(response.text)[0]
+        cursor = response.flight.get("pageInfo.endCursor")
+        if not cursor:
+            return
+        try:
+            next_page = call_server_action(
+                response.url, action_id, [cursor],
+                router_state_tree='["",{},null,null,true]',  # captured once from a browser
+            )
+        except ActionNotFoundError:
+            self.logger.warning(f"{response.url}: stale action id, needs re-discovery")
+            return
+        yield from next_page.find_all_by_keys({"price", "title"})
+```
+
+For chasing a paginated action across many pages, `FlightSession`
+(carrying cookies and the router-state-tree forward automatically) is a
+better fit than threading `router_state_tree`/`action_id` through spider
+instance attributes or `Request.meta` by hand:
+
+```python
+from nextflight import FlightSession
+
+class ListingSpider(scrapy.Spider):
+    name = "listings"
+
+    def start_requests(self):
+        self._session = FlightSession()
+        self._action_id = None  # set from find_server_action_ids() on first page
+        page = self._session.get(self.start_urls[0])
+        yield from self._process_page(page)
+
+    def _process_page(self, page):
+        yield from page.find_all_by_keys({"price", "title"})
+        cursor = page.get("pageInfo.endCursor")
+        if cursor and self._action_id:
+            next_page = self._session.call_action(
+                self.start_urls[0], self._action_id, [cursor],
+            )
+            yield from self._process_page(next_page)
+```
+
+`FlightSession` makes its requests outside Scrapy's own downloader
+(stdlib `urllib` by default, or a `requests.Session` passed as
+`backend=`), so it doesn't go through `DOWNLOADER_MIDDLEWARES`,
+`AutoThrottle`, or Scrapy's own concurrency limits — reach for it
+specifically for action-chasing workflows Scrapy's request/response
+cycle doesn't model well, not as a general request replacement.
+
 ## Fetching the lightweight RSC payload instead of full HTML
 
 For leaf/detail pages you extract data from but don't need to crawl
@@ -430,6 +499,37 @@ middleware on purpose — `parse_confidence()` returns `1.0` when there's
 nothing to have parsed badly, so a non-Next.js page won't loop here.
 Requires Scrapy >= 2.5; disables itself via `NotConfigured` on older
 Scrapy.
+
+**Telling a block apart from a truncation (new in 0.4.2)** — a low
+confidence score alone doesn't say *why* a page looks wrong. A
+genuinely truncated response and a deliberate bot-mitigation block score
+the same way, but call for opposite reactions: plain retry vs. rotating
+proxy/User-Agent. `FlightRetryMiddleware` already annotates its retry
+reason with a vendor label (`cloudflare`, `akamai`, `datadome`,
+`perimeterx`) when `detect_challenge_page()` recognizes one, visible in
+Scrapy's own retry log line — but the retry *decision* itself doesn't
+change per vendor. To react differently per vendor (e.g. only rotate a
+proxy on a real challenge, not on a truncation), call it directly in
+your own `process_response` or spider callback instead:
+
+```python
+from nextflight import detect_challenge_page, detect_deployment_protection
+
+def parse(self, response):
+    vendor = detect_challenge_page(response)
+    if vendor:
+        self.logger.warning(f"{response.url}: {vendor} challenge page, rotating proxy")
+        raise IgnoreRequest  # or re-queue with a different proxy/UA
+    if detect_deployment_protection(response):
+        self.logger.warning(f"{response.url}: behind Vercel deployment protection")
+        return  # not a data page at all -- nothing to parse here
+    listing = response.flight.find_by_keys({"price", "title"})
+```
+
+`detect_deployment_protection()` catches a different "200 but not real
+content" trap specific to Vercel: a preview (or protected production)
+deployment sitting behind Vercel's own login wall, easy to silently
+misread as "the page was just mostly empty."
 
 ## Crawl-wide stats: parse confidence, version drift, early-stop counts
 

@@ -76,7 +76,7 @@ try:
 except ImportError:  # pragma: no cover - Scrapy < 2.5 lacks get_retry_request
     _RETRY_AVAILABLE = False
 
-from .extractor import FlightExtractor
+from .extractor import FlightExtractor, detect_challenge_page
 
 logger = logging.getLogger(__name__)
 
@@ -659,6 +659,20 @@ class FlightRetryMiddleware:
         if confidence >= self.min_confidence:
             return response
         reason = f"low nextflight parse confidence ({confidence:.2f} < {self.min_confidence})"
+        # Low confidence alone doesn't say *why* the page looks wrong --
+        # a genuinely truncated response and a deliberate bot-mitigation
+        # block score the same way here. Fold in the fingerprint check
+        # (best-effort; failures are swallowed) purely for a more useful
+        # retry reason/log line -- it doesn't change *whether* this
+        # retries, only what gets logged, so a caller who wants different
+        # behavior per vendor should call detect_challenge_page() directly
+        # in their own process_response instead.
+        try:
+            vendor = detect_challenge_page(response)
+        except Exception:
+            vendor = None
+        if vendor:
+            reason += f"; looks like a {vendor} challenge page"
         retry_request = get_retry_request(
             request, spider=spider, reason=reason, max_retry_times=self.max_retry_times,
         )
