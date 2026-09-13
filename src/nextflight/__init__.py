@@ -29,6 +29,12 @@ from .extractor import (
     find_next_chunk_urls,
     find_pagination_action,
     find_error_digest,
+    find_api_routes,
+    find_meta_tags,
+    is_route_slot_key,
+    is_intercepting_route_segment,
+    discover_urls_from_sitemap,
+    detect_locale,
     detect_next_router,
     detect_base_path,
     diff_pages,
@@ -62,6 +68,12 @@ __all__ = [
     "find_next_chunk_urls",
     "find_pagination_action",
     "find_error_digest",
+    "find_api_routes",
+    "find_meta_tags",
+    "is_route_slot_key",
+    "is_intercepting_route_segment",
+    "discover_urls_from_sitemap",
+    "detect_locale",
     "detect_next_router",
     "detect_base_path",
     "diff_pages",
@@ -84,7 +96,7 @@ __all__ = [
     "extract_json_ld",      # deprecated alias, see below
 ]
 
-__version__ = "0.4.3"
+__version__ = "0.4.6"
 
 
 # ---------------------------------------------------------------------- #

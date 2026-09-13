@@ -342,6 +342,34 @@ some domains need anti-bot handling and others don't), streaming still
 helps the plain-HTTP subset — there's no need to disable it project-wide
 just because some spiders use one of these.
 
+## Telling streamed data apart from the initial shell
+
+A page rendered with `<Suspense>` boundaries (or Partial Prerendering)
+doesn't arrive as one atomic blob — the initial HTML has a shell, and
+slower-loading sections stream in afterward as separate
+`self.__next_f.push(...)` calls appended to the document. Once the full
+response is buffered (the normal case for a plain `requests`/Scrapy
+crawl, as opposed to processing it live via `FlightStreamingMiddleware`
+above), `response.flight.streamed_chunks()` tells you which chunk ids
+arrived after the shell rather than being present from the start:
+
+```python
+def parse(self, response):
+    page = response.flight
+    if page.is_ppr_page():
+        self.logger.debug(f"{response.url}: PPR page, some data was dynamically rendered")
+    split = page.static_vs_dynamic_chunks()
+    # e.g. cache the static shell aggressively, always re-fetch the dynamic part
+    listing = page.find_by_keys({"price", "title"})
+```
+
+This is inferred from `push()` call boundaries already present in the
+fully-buffered HTML, not a live timing measurement — for genuinely
+live/incremental processing where exact arrival timing matters, use
+`from_stream()` (see the main README) or `FlightStreamingMiddleware`
+above instead, which observe chunks as they actually arrive over the
+wire rather than reconstructing order after the fact.
+
 ## Calling a Server Action from a spider callback
 
 `find_server_action_ids()` (0.4.1) only *discovers* an action id.
@@ -411,6 +439,46 @@ class ListingSpider(scrapy.Spider):
 specifically for action-chasing workflows Scrapy's request/response
 cycle doesn't model well, not as a general request replacement.
 
+**Chasing an action through Scrapy's own request/response cycle
+instead (new in 0.4.4)** — if a workflow fits naturally as a `yield
+scrapy.Request(...)` chain (so it goes through `DOWNLOADER_MIDDLEWARES`,
+retries, `AutoThrottle`, etc. like any other request), `build_action_meta()`/
+`read_action_meta()` give the `action_id`/`router_state_tree` a documented
+home in `Request.meta` instead of spider instance attributes:
+
+```python
+from nextflight.scrapy_middleware import build_action_meta, read_action_meta
+
+def parse(self, response):
+    action_id = find_server_action_ids(response.text)[0]
+    cursor = response.flight.get("pageInfo.endCursor")
+    if cursor:
+        yield scrapy.Request(
+            response.url, method="POST",
+            meta=build_action_meta(action_id, '["",{},null,null,true]', cursor=cursor),
+            callback=self.parse_next_page,
+            dont_filter=True,
+        )
+
+def parse_next_page(self, response):
+    ctx = read_action_meta(response)
+    # response.flight already reflects the action's response body if
+    # FlightMiddleware is enabled and the request carried the right
+    # Next-Action/body -- see call_server_action() for what to set on
+    # the Request itself.
+    yield from response.flight.find_all_by_keys({"price", "title"})
+```
+
+`build_action_meta()`/`read_action_meta()` only manage *where the
+context lives* between requests — they don't set the `Next-Action`
+header or encode the request body for you. For the request itself, either
+call `call_server_action()` directly (simpler, but makes its own request
+outside Scrapy's downloader — see above) or set the same headers/body it
+uses (`Accept: text/x-component`, `Next-Action: <id>`,
+`Next-Router-State-Tree: <urlencoded tree>`, and a JSON array body) on
+the `scrapy.Request` yourself if the request truly needs to go through
+Scrapy's own downloader middleware chain.
+
 ## Fetching the lightweight RSC payload instead of full HTML
 
 For leaf/detail pages you extract data from but don't need to crawl
@@ -467,6 +535,19 @@ NEXTFLIGHT_DEDUPE_KEY = "id"   # optional -- fingerprint just this field, cheape
                                 # than the whole item if other fields (a "last seen" timestamp,
                                 # say) can legitimately differ between two crawls of the same listing
 ```
+
+**Fingerprinting on several fields (new in 0.4.4)** — `NEXTFLIGHT_DEDUPE_KEYS`
+(plural, a list) fingerprints more than one field together, for when a
+single field alone isn't a reliable enough identity (e.g. `id` gets
+reused across categories, but `id` + `price` + `title` together is
+distinctive enough):
+
+```python
+NEXTFLIGHT_DEDUPE_KEYS = ["id", "price", "title"]
+```
+
+Set only one of `NEXTFLIGHT_DEDUPE_KEY`/`NEXTFLIGHT_DEDUPE_KEYS` — setting
+both raises `NotConfigured` at startup rather than silently picking one.
 
 Only dict-shaped items are ever considered for deduplication —
 `scrapy.Request` objects and typed `Item`/dataclass instances a spider
@@ -614,6 +695,65 @@ per-page, which can be noisy on a site with genuinely sparse listings)
 is usually the better signal-to-noise tradeoff for a long-running crawl
 — check `nextflight/avg_parse_confidence` in `spider_closed` instead of
 alerting on every individual low-confidence response.
+
+## In-flight schema-drift alerts and confidence-driven throttling
+
+`NextflightStatsExtension` and the alerting pattern above both surface
+problems at `spider_closed` or per-response, but a project that wants to
+*react live* — pausing, alerting immediately, or slowing down before a
+challenge page turns into a full block — has two purpose-built pieces:
+
+```python
+# settings.py
+SPIDER_MIDDLEWARES = {
+    "nextflight.scrapy_middleware.NextflightSpiderMiddleware": 543,
+}
+DOWNLOADER_MIDDLEWARES = {
+    "nextflight.scrapy_middleware.FlightMiddleware": 543,
+    "nextflight.scrapy_middleware.FlightAutoThrottleMiddleware": 551,
+}
+AUTOTHROTTLE_ENABLED = True   # FlightAutoThrottleMiddleware adjusts *on top of* this
+NEXTFLIGHT_DRIFT_MIN_SAMPLES = 5      # baseline needs this many responses per domain first
+NEXTFLIGHT_DRIFT_THRESHOLD = 0.3      # signal fires when confidence drops this far below baseline
+NEXTFLIGHT_THROTTLE_WINDOW = 20       # responses per domain to average over
+NEXTFLIGHT_THROTTLE_MIN_CONFIDENCE = 0.7
+NEXTFLIGHT_THROTTLE_FACTOR = 2.0      # multiply the slot's current delay by this much
+```
+
+`NextflightSpiderMiddleware` fires a custom `schema_drift` signal the
+moment a response's confidence drops significantly below its own
+running per-domain baseline — connect to it like any other signal:
+
+```python
+from nextflight.scrapy_middleware import schema_drift
+
+class MySpider(scrapy.Spider):
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(spider.on_schema_drift, signal=schema_drift)
+        return spider
+
+    def on_schema_drift(self, domain, confidence, baseline, response, spider):
+        spider.logger.warning(
+            f"{domain}: confidence dropped to {confidence:.2f} (baseline {baseline:.2f})"
+        )
+```
+
+The baseline is a simple running mean seeded from the first
+`NEXTFLIGHT_DRIFT_MIN_SAMPLES` responses per domain before the check
+starts firing at all, so a site this library never parses perfectly to
+begin with doesn't spuriously "drift" from its own already-imperfect
+starting point.
+
+`FlightAutoThrottleMiddleware` reacts to the same underlying signal
+(a rolling confidence average, tracked separately) by adjusting the
+domain's own Scrapy download-slot delay directly — slowing down while
+confidence is low, relaxing back off once it recovers. It only
+*adjusts the multiplier* on top of whatever AutoThrottle (or a fixed
+`DOWNLOAD_DELAY`) already computed, and requires the crawl engine to
+already be running (it reads `crawler.engine.downloader.slots`) —
+gracefully does nothing if that isn't available yet rather than raising.
 
 ## Following links that only exist in Flight JSON, not rendered HTML
 

@@ -1,0 +1,68 @@
+{
+  "keys": [
+    "0",
+    "1",
+    "2",
+    "4"
+  ],
+  "resolve_all": {
+    "0": [
+      "$",
+      "div",
+      null,
+      {
+        "children": [
+          "$",
+          "section",
+          null,
+          {
+            "children": {
+              "reviews": [
+                {
+                  "author": "B. Reviewer",
+                  "rating": 4
+                }
+              ],
+              "streamedAt": "2024-06-01 00:00:00+00:00"
+            }
+          }
+        ]
+      }
+    ],
+    "1": {
+      "price": 5999,
+      "title": "Product F"
+    },
+    "2": {
+      "reviews": [
+        {
+          "author": "B. Reviewer",
+          "rating": 4
+        }
+      ],
+      "streamedAt": "2024-06-01 00:00:00+00:00"
+    },
+    "4": {
+      "author": "B. Reviewer",
+      "rating": 4
+    }
+  },
+  "stats": {
+    "chunk_count": 4,
+    "chunk_ids": [
+      "0",
+      "1",
+      "2",
+      "4"
+    ],
+    "flight_row_kind_counts": {
+      "json": 4
+    },
+    "html_chunk_count": 0,
+    "json_chunk_count": 4,
+    "value_type_counts": {
+      "dict": 3,
+      "list": 1
+    }
+  }
+}

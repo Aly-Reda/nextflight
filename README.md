@@ -328,7 +328,10 @@ around the raw-string encoding yourself, either update that code or pass
 | `.stats()` | `dict` | Chunk count, row-kind breakdown, page size |
 | `.parse_confidence()` | `dict` | Score + breakdown of cleanly-parsed vs. raw-fallback vs. repaired chunks |
 | `.is_fallback_skeleton()` | `bool` | **New in 0.4.3.** Heuristic: looks like an ISR `fallback:true`/`'blocking'` cold-path loading skeleton rather than a real content page |
-| `.next_version_hint()` | `dict` | Best-effort guess at which Next.js version range produced this payload |
+| `.streamed_chunks()` | `list[str]` | **New in 0.4.5.** Chunk ids that arrived after the initial shell (a later `push()` call), vs. present from the start |
+| `.is_ppr_page()` | `bool` | **New in 0.4.5.** Best-effort detector for a Partial Prerendering (static shell + dynamic holes) page |
+| `.static_vs_dynamic_chunks()` | `dict` | **New in 0.4.5.** `{"static": [...], "dynamic": [...]}` split using `.streamed_chunks()` as the boundary |
+| `.next_version_hint()` | `dict` | Best-effort guess at which Next.js version range produced this payload, plus (**new in 0.4.6**) which bundler (`"webpack"`/`"turbopack"`) built it |
 
 **Resolving data** (dereferencing `$`-refs)
 
@@ -446,6 +449,28 @@ identity` request.
 - **`find_error_digest(html) -> str | None`** — **new in 0.4.3.**
   Extracts a Server Component error's `digest` correlation id from a
   rendered error page, for more actionable failure logging.
+- **`find_api_routes(html) -> list[str]`** — **new in 0.4.4.** Finds
+  `fetch("/api/...")`-shaped calls to App Router Route Handlers — a
+  separate mechanism from Server Actions, no `Next-Action` header needed
+  to call one.
+- **`find_meta_tags(html) -> dict`** — **new in 0.4.4.** Extracts Open
+  Graph/Twitter Card `<meta>` tags into a flat dict — a third
+  structured-data fallback source (Flight → JSON-LD → meta tags)
+  alongside `find_json_ld`.
+- **`discover_urls_from_sitemap(base_url, session=None) -> list[str]`**
+  — **new in 0.4.4.** Fetches `/sitemap.xml` (following one level of
+  `<sitemapindex>` nesting) and returns every `<loc>` URL — stdlib-only,
+  for seeding `start_urls` on a site with a dynamically-generated
+  sitemap.
+- **`is_route_slot_key(key) -> bool`** / **`is_intercepting_route_segment(segment) -> bool`**
+  — **new in 0.4.4.** Recognize App Router `@slot` parallel-route keys
+  and `(.)`/`(..)`/`(...)` intercepting-route segments. For
+  *identifying* the convention only — search already walks into a
+  slot's content transparently with no special handling needed.
+- **`detect_locale(html_or_url) -> str | None`** — **new in 0.4.6.**
+  Best-effort locale detection: checks `<html lang="...">`, then a
+  path-prefixed locale segment (`/en/...`), then a locale-coded
+  subdomain — the latter two validated against an ISO 639-1 code list.
 - **`diff_pages(old, new, id_key=None) -> dict`** — module-level form of
   `.diff()`.
 - **`call_server_action(url, action_id, args=(), *, router_state_tree, session=None, headers=None, cookies=None, timeout=15.0) -> FlightExtractor`**
@@ -496,12 +521,26 @@ nextflight <file-or-url>
   [--keys a,b | --all-by-keys a,b | --any-keys a,b
    | --type Product | --text PATTERN | --get path.to.value
    | --json-keys | --html-keys | --tree
-   | --router | --next-data | --stats | --watch SECONDS | --all]
+   | --router | --next-data | --stats | --version-hint
+   | --locale | --meta-tags | --api-routes | --base-path
+   | --error-digest | --pagination | --watch SECONDS | --all]
   [--rsc] [--redact] [--save out.json]
 ```
 
 - `--tree` prints a `.shape()` summary instead of full values.
-- `--router` / `--next-data` cover Pages Router pages.
+- `--router` / `--next-data` cover Pages Router pages — `--router` also
+  reports `"static_export"` for `output: 'export'` builds.
+- `--version-hint` prints the best-effort Next.js version range plus
+  bundler guess (`webpack`/`turbopack`).
+- `--locale`, `--meta-tags`, `--api-routes`, `--base-path`,
+  `--error-digest`, and `--pagination` expose the corresponding
+  module-level functions (see API reference above) for quick
+  command-line exploration without writing Python. These are all
+  HTML-only checks — header-dependent functions (`get_cache_status`,
+  `detect_challenge_page`'s header check, `detect_draft_mode`,
+  `detect_middleware_rewrite`, rate-limit/geo headers) need a real
+  response object and aren't currently exposed via the CLI, which only
+  ever sees the fetched HTML text, not headers.
 - `--rsc` fetches the raw RSC payload instead of full HTML (URL sources
   only) — lighter weight, also works with `--watch`.
 - `--watch SECONDS` polls a URL and prints only what changed since the

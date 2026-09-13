@@ -1,5 +1,157 @@
 # Changelog
 
+## 0.4.6
+
+The P3 tier: polish and crawl-health monitoring, the lowest-urgency items
+from the original 26-item scoping pass. This closes out that entire
+document — every item across all four parts now has a corresponding
+release (0.4.2 through 0.4.6).
+
+### New: locale and bundler detection
+
+- `detect_locale(html_or_url) -> str | None`: best-effort locale
+  detection checking, in order, the rendered `<html lang="...">`
+  attribute, a path-prefixed locale segment (`/en/...`), and a
+  locale-coded subdomain (`en.example.com`) — the latter two validated
+  against an ISO 639-1 code list so an arbitrary two-letter path segment
+  isn't mistaken for a locale.
+- `FlightExtractor.next_version_hint()` gained a `"bundler"` field
+  (`"webpack"`, `"turbopack"`, or `"unknown"`) alongside the existing
+  Next.js version range, so a `parse_confidence()` drop caused by a
+  bundler switch (e.g. a project opting into Turbopack) can be correctly
+  attributed instead of being mistaken for an actual wire-format break.
+  **Minor shape change**: the returned dict has one new key; code doing
+  exact dict-equality comparisons against the old shape needs updating.
+
+### New: crawl-health monitoring (Scrapy)
+
+- `FlightAutoThrottleMiddleware`: adjusts Scrapy's own per-domain
+  download-slot delay based on a rolling nextflight parse-confidence
+  trend — slows requests to a domain proactively when confidence starts
+  trending down (often an early sign of an intermittent challenge page
+  or a site starting to rate-limit), and relaxes back off once it
+  recovers. Layers on top of AutoThrottle/a fixed `DOWNLOAD_DELAY`
+  rather than replacing either.
+- `NextflightSpiderMiddleware` + the new `schema_drift` signal: fires
+  when a response's parse confidence drops significantly below its own
+  running per-domain baseline, for in-flight alerting/graceful-stop
+  logic — complements `NextflightStatsExtension`'s end-of-crawl summary
+  with a live early-warning path.
+
+### Verified: route groups
+
+- Added regression tests confirming `(group)`-style App Router route
+  segments behave as ordinary dict keys throughout `.shape()`/
+  `find_by_keys()`/resolution — no code changes were needed; this was
+  already correct, now it's pinned.
+
+### CLI and docs catch-up
+
+- The CLI gained `--version-hint`, `--locale`, `--meta-tags`,
+  `--api-routes`, `--base-path`, `--error-digest`, and `--pagination`,
+  exposing the corresponding HTML-only functions added across
+  0.4.2–0.4.6 for quick exploration without writing Python. (Functions
+  that need real response headers rather than just HTML text —
+  `get_cache_status`, `detect_draft_mode`, `detect_middleware_rewrite`,
+  rate-limit/geo headers — remain Python-API-only for now, since the CLI
+  only ever fetches and holds onto HTML text, not the response object.)
+- `docs/anti-bot-cookbook.md` was updated to cover `detect_challenge_page`,
+  `detect_deployment_protection`, `detect_draft_mode`, and
+  `is_fallback_skeleton` — it previously only discussed anti-bot
+  blockers in the abstract, predating all of the concrete detection
+  helpers this project shipped to address exactly that gap.
+
+## 0.4.5
+
+Streaming/Suspense boundary visibility and Partial Prerendering (PPR)
+awareness — held for this release since they needed the most new
+golden-file fixture work of the P2 tier, per the original scoping
+document's own release plan.
+
+### New: streaming/Suspense boundary visibility
+
+- `FlightExtractor.streamed_chunks() -> list[str]`: chunk ids that
+  arrived after the initial shell (i.e. in a `self.__next_f.push(...)`
+  call other than the first one on the page), distinguishing "was
+  present in the initial HTML" from "arrived later via streaming" once a
+  `<Suspense>` boundary's data became ready. Inferred from `push()` call
+  boundaries in an already-fully-buffered page — a real, if informal,
+  invariant of how Next.js emits Flight data (the first call is always
+  the initial shell; each later, separate call is appended only once its
+  boundary resolves), not a live measurement. For a genuinely live
+  stream where exact timing matters, `from_stream()` (0.3.x) already
+  yields chunks as they actually arrive.
+
+### New: Partial Prerendering (PPR) awareness
+
+- `FlightExtractor.is_ppr_page() -> bool`: best-effort detector combining
+  `streamed_chunks()` being non-empty with the presence of an async
+  placeholder marker (`$@<id>`) in the raw row text — the two signals
+  that, in practice, only co-occur on a PPR page. Documented as
+  best-effort: PPR's dynamic holes use the same Suspense/streaming
+  machinery as an ordinary `loading.tsx` boundary, so this can't
+  perfectly distinguish "PPR" from "an ordinary streamed page" in every
+  case.
+- `FlightExtractor.static_vs_dynamic_chunks() -> dict`: splits chunk ids
+  into `{"static": [...], "dynamic": [...]}` using `streamed_chunks()`
+  as the split point, for a crawler that wants to cache the static shell
+  aggressively and only re-fetch the dynamic part.
+
+New golden-file fixture (`tests/fixtures/streaming-ppr-0.4.5/`) added to
+the corpus, exercising a static shell referencing an async placeholder
+whose data arrives in a second, separate `push()` call.
+
+All backward compatible — three new read-only methods, no changes to
+any existing behavior or return shape.
+
+## 0.4.4
+
+The P2 tier: real gaps that come up less often than the 0.4.2/0.4.3
+correctness issues, but are still worth closing without dedicated
+per-project workarounds — parallel/intercepting route recognition, App
+Router API route discovery, cross-page dedupe on multiple fields, a
+documented `meta` convention for action-chasing spiders, Open
+Graph/Twitter meta-tag fallback extraction, and sitemap-based URL
+discovery.
+
+### New: route conventions and discovery
+
+- `is_route_slot_key(key) -> bool` / `is_intercepting_route_segment(segment) -> bool`:
+  recognize App Router `@slot` parallel-route keys and `(.)`/`(..)`/
+  `(...)`/`(..)(..)` intercepting-route segments. Worth noting: these are
+  purely for *identifying* the convention (diagnostics, `.shape()`-style
+  display) — `find_by_keys()`/`find_all()`/`resolve_all()` already walk
+  into a slot's nested content transparently with no changes needed,
+  since they recurse by value regardless of key name.
+- `find_api_routes(html) -> list[str]`: finds `fetch("/api/...")`-shaped
+  calls to App Router Route Handlers, a separate mechanism from Server
+  Actions, rounding out data-fetching discovery alongside
+  `find_server_action_ids()`/`find_next_chunk_urls()`.
+- `find_pagination_action`, from 0.4.3, already covers the "how do I
+  find the next-page cursor" half of item 12's ask; see that release's
+  changelog entry.
+- `discover_urls_from_sitemap(base_url, session=None) -> list[str]`:
+  fetches `/sitemap.xml` (following one level of `<sitemapindex>`
+  nesting), for seeding `start_urls` on an App Router site with a
+  dynamically-generated sitemap. Stdlib-only.
+- `find_meta_tags(html) -> dict`: extracts Open Graph/Twitter Card
+  `<meta>` tags into a flat dict — a third structured-data fallback
+  source (Flight → JSON-LD → meta tags) alongside `find_json_ld`.
+
+### New: Scrapy integration
+
+- `FlightDedupeMiddleware` now accepts `NEXTFLIGHT_DEDUPE_KEYS` (a list)
+  in addition to the existing `NEXTFLIGHT_DEDUPE_KEY` (a single string)
+  — fingerprint several fields together (e.g. `id` + `price` + `title`)
+  instead of just one. Setting both raises `NotConfigured`. Fully
+  backward compatible: `.dedupe_key` (singular) remains a valid read-only
+  accessor for the first configured key.
+- `build_action_meta(action_id, router_state_tree=None, **extra) -> dict`
+  / `read_action_meta(request_or_response) -> dict`: the documented
+  convention for passing Server Action context through
+  `Request.meta`/`Response.meta` in a callback chain, for action-chasing
+  spiders not using `FlightSession` (0.4.2).
+
 ## 0.4.3
 
 Closes the P1 "silent wrong data" / misclassification traps identified

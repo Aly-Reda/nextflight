@@ -6,6 +6,9 @@ Command-line entry point for quick exploration:
     nextflight page.html --all > everything.json
     nextflight page.html --tree
     nextflight https://example.com/product/123 --watch 30
+    nextflight page.html --version-hint
+    nextflight page.html --locale
+    nextflight page.html --meta-tags
 """
 
 from __future__ import annotations
@@ -17,7 +20,18 @@ import sys
 import time
 from typing import Any
 
-from .extractor import FlightExtractor, detect_next_router, diff_pages, find_next_data
+from .extractor import (
+    FlightExtractor,
+    detect_next_router,
+    detect_base_path,
+    detect_locale,
+    diff_pages,
+    find_next_data,
+    find_meta_tags,
+    find_api_routes,
+    find_error_digest,
+    find_pagination_action,
+)
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.\w+")
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\-\s()]{7,}\d)(?!\d)")
@@ -86,10 +100,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tree", action="store_true",
                          help="Print a compact key/type shape summary of every chunk instead of full values.")
     parser.add_argument("--router", action="store_true",
-                         help='Detect which Next.js router rendered the page: "app", "pages", "both", or "unknown".')
+                         help='Detect which Next.js router rendered the page: "app", "pages", "both", '
+                              '"static_export", or "unknown".')
     parser.add_argument("--next-data", dest="next_data", action="store_true",
                          help="Dump the Pages Router __NEXT_DATA__ JSON blob instead of Flight data.")
     parser.add_argument("--stats", action="store_true", help="Print a quick diagnostic summary instead of data.")
+    parser.add_argument("--version-hint", dest="version_hint", action="store_true",
+                         help="Best-effort Next.js version range + bundler (webpack/turbopack) guess.")
+    parser.add_argument("--locale", action="store_true",
+                         help="Best-effort locale detection (<html lang>, path prefix, or subdomain).")
+    parser.add_argument("--meta-tags", dest="meta_tags", action="store_true",
+                         help="Extract Open Graph / Twitter Card <meta> tags into a flat dict.")
+    parser.add_argument("--api-routes", dest="api_routes", action="store_true",
+                         help='Find fetch("/api/...") calls to App Router Route Handlers in the page text.')
+    parser.add_argument("--base-path", dest="base_path", action="store_true",
+                         help="Detect a next.config.js basePath / multi-zone prefix from chunk URLs.")
+    parser.add_argument("--error-digest", dest="error_digest", action="store_true",
+                         help="Extract a Server Component error page's digest correlation id, if present.")
+    parser.add_argument("--pagination", action="store_true",
+                         help="Find the common cursor-pagination shape (hasNextPage/cursor/endCursor) in the page.")
     parser.add_argument("--watch", dest="watch_seconds", type=float, default=None,
                          help="Poll a URL every N seconds and print only what changed since the last poll (URL sources only).")
     parser.add_argument("--save", dest="save_path", help="Write output to this file instead of stdout.")
@@ -150,6 +179,26 @@ def main(argv=None) -> int:
         _write_output(detect_next_router(html), args)
         return 0
 
+    if args.locale:
+        _write_output(detect_locale(html), args)
+        return 0
+
+    if args.meta_tags:
+        _write_output(find_meta_tags(html), args)
+        return 0
+
+    if args.api_routes:
+        _write_output(find_api_routes(html), args)
+        return 0
+
+    if args.base_path:
+        _write_output(detect_base_path(html), args)
+        return 0
+
+    if args.error_digest:
+        _write_output(find_error_digest(html), args)
+        return 0
+
     if args.next_data:
         next_data_result = find_next_data(html)
         if next_data_result is None:
@@ -187,12 +236,18 @@ def main(argv=None) -> int:
         result = extractor.shape()
     elif args.stats:
         result = extractor.stats()
+    elif args.version_hint:
+        result = extractor.next_version_hint()
+    elif args.pagination:
+        result = find_pagination_action(extractor)
     elif args.all:
         result = extractor.resolve_all()
     else:
         parser.error(
             "Provide one of --keys, --all-by-keys, --any-keys, --type, --text, --get, "
-            "--json-keys, --html-keys, --tree, --router, --next-data, --stats, --watch, or --all."
+            "--json-keys, --html-keys, --tree, --router, --next-data, --stats, --version-hint, "
+            "--locale, --meta-tags, --api-routes, --base-path, --error-digest, --pagination, "
+            "--watch, or --all."
         )
         return 2
 

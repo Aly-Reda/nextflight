@@ -1605,7 +1605,7 @@ def test_next_version_hint_matches_registry_entry():
 def test_next_version_hint_no_markers_found():
     page = extract("<html><body>not a next.js page</body></html>")
     hint = page.next_version_hint()
-    assert hint == {"range": None, "notes": None, "matches": []}
+    assert hint == {"range": None, "notes": None, "matches": [], "bundler": "unknown"}
 
 
 def test_suggest_similar_keys_finds_close_matches():

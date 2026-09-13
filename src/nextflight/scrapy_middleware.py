@@ -47,10 +47,11 @@ per-domain version-hint logging) below.
 from __future__ import annotations
 
 import codecs
+import collections
 import logging
 import re
 import weakref
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 from urllib.parse import urlparse
 
 try:
@@ -732,7 +733,8 @@ class FlightDedupeMiddleware:
 
         SPIDER_MIDDLEWARES = {"nextflight.scrapy_middleware.FlightDedupeMiddleware": 543}
         NEXTFLIGHT_DEDUPE_ACROSS_PAGES = True
-        NEXTFLIGHT_DEDUPE_KEY = "id"   # optional -- fingerprint just this field instead of the whole item
+        NEXTFLIGHT_DEDUPE_KEY = "id"                       # fingerprint just this one field, or
+        NEXTFLIGHT_DEDUPE_KEYS = ["id", "price", "title"]  # -- new in 0.4.4 -- fingerprint several fields
 
     Only dict-shaped items are considered for deduplication -- `Request`
     objects and Scrapy `Item`/dataclass instances a spider yields for
@@ -740,22 +742,46 @@ class FlightDedupeMiddleware:
     untouched, so this never accidentally drops a page still queued to
     be crawled.
 
-    `NEXTFLIGHT_DEDUPE_KEY` fingerprints just that one field (e.g. a
-    stable listing id) instead of the whole item -- much cheaper for
-    large items, and correctly treats two crawls of the same listing
-    with an incidentally-changed field (a "last seen" timestamp, say) as
-    the same item rather than as two different ones."""
+    `NEXTFLIGHT_DEDUPE_KEY`/`NEXTFLIGHT_DEDUPE_KEYS` fingerprint just the
+    named field(s) (e.g. a stable listing id, or `id` + `price` + `title`
+    together) instead of the whole item -- much cheaper for large items,
+    and correctly treats two crawls of the same listing with an
+    incidentally-changed field (a "last seen" timestamp, say) as the same
+    item rather than as two different ones. `NEXTFLIGHT_DEDUPE_KEYS`
+    (plural, a list) and `NEXTFLIGHT_DEDUPE_KEY` (singular, a string) are
+    two ways to set the same thing -- pass whichever reads better;
+    setting both is an error, since there's no sensible way to combine
+    them."""
 
-    def __init__(self, dedupe_key: Optional[str] = None) -> None:
-        self.dedupe_key = dedupe_key
+    def __init__(self, dedupe_key: Optional[Union[str, Iterable]] = None) -> None:
+        if isinstance(dedupe_key, str):
+            self.dedupe_keys: Optional[tuple] = (dedupe_key,)
+        elif dedupe_key is not None:
+            self.dedupe_keys = tuple(dedupe_key)
+        else:
+            self.dedupe_keys = None
         self._seen: set = set()
+
+    @property
+    def dedupe_key(self) -> Optional[str]:
+        """Backward-compatible single-field accessor: the first
+        configured key, or `None`. Prefer `.dedupe_keys` (plural) for new
+        code -- this exists only so 0.4.3-and-earlier code reading
+        `.dedupe_key` after construction keeps working unchanged."""
+        return self.dedupe_keys[0] if self.dedupe_keys else None
 
     @classmethod
     def from_crawler(cls, crawler: Any) -> "FlightDedupeMiddleware":
         settings = crawler.settings
         if not settings.getbool("NEXTFLIGHT_DEDUPE_ACROSS_PAGES", False):
             raise NotConfigured("NEXTFLIGHT_DEDUPE_ACROSS_PAGES is not enabled")
-        return cls(dedupe_key=settings.get("NEXTFLIGHT_DEDUPE_KEY"))
+        single = settings.get("NEXTFLIGHT_DEDUPE_KEY")
+        multi = settings.getlist("NEXTFLIGHT_DEDUPE_KEYS")
+        if single and multi:
+            raise NotConfigured(
+                "Set only one of NEXTFLIGHT_DEDUPE_KEY or NEXTFLIGHT_DEDUPE_KEYS, not both."
+            )
+        return cls(dedupe_key=multi or single)
 
     def process_spider_output(self, response: Any, result: Any, spider: Any) -> Any:
         for item in result:
@@ -767,13 +793,190 @@ class FlightDedupeMiddleware:
             yield item
 
     def _fingerprint(self, item: dict) -> Any:
-        if self.dedupe_key is not None:
-            return (self.dedupe_key, item.get(self.dedupe_key))
+        if self.dedupe_keys is not None:
+            return tuple((key, item.get(key)) for key in self.dedupe_keys)
         from .extractor import _json_dumps_sorted
         try:
             return _json_dumps_sorted(item)
         except TypeError:
             return repr(item)
+
+
+schema_drift = object()
+"""Custom Scrapy signal fired by `NextflightSpiderMiddleware` when a
+response's parse confidence drops significantly below its own running
+per-domain baseline. Connect to it like any other Scrapy signal::
+
+    crawler.signals.connect(handler, signal=schema_drift)
+
+Handler receives keyword arguments: `domain`, `confidence`, `baseline`,
+`response`, `spider`."""
+
+
+class FlightAutoThrottleMiddleware:
+    """Downloader middleware that adjusts Scrapy's own per-slot download
+    delay based on a rolling nextflight parse-confidence trend for each
+    domain, instead of reacting only to HTTP status codes/latency the
+    way AutoThrottle's own signal does. A confidence trending down for a
+    domain is often an early warning sign -- a challenge page starting
+    to appear intermittently, or a site beginning to rate-limit -- well
+    before it shows up as outright HTTP errors; this slows requests to
+    that domain proactively instead of waiting for a harder failure, and
+    relaxes the extra delay back off once confidence recovers.
+
+    Enable via::
+
+        DOWNLOADER_MIDDLEWARES = {
+            "nextflight.scrapy_middleware.FlightMiddleware": 543,
+            "nextflight.scrapy_middleware.FlightAutoThrottleMiddleware": 551,
+        }
+        AUTOTHROTTLE_ENABLED = True                    # or a fixed DOWNLOAD_DELAY -- see below
+        NEXTFLIGHT_THROTTLE_WINDOW = 20                # responses per domain to average over
+        NEXTFLIGHT_THROTTLE_MIN_CONFIDENCE = 0.7       # rolling average below this triggers slowdown
+        NEXTFLIGHT_THROTTLE_FACTOR = 2.0               # multiply the slot's current delay by this much
+
+    This middleware only *adjusts the multiplier* on top of whatever
+    AutoThrottle (or a fixed `DOWNLOAD_DELAY`) already computed for a
+    domain's download slot -- it does not replace AutoThrottle and has
+    no visible effect if neither `AUTOTHROTTLE_ENABLED` nor a
+    `DOWNLOAD_DELAY` is set, since there's no existing slot delay to
+    adjust in that case.
+
+    Requires the crawl engine to already be running (this reads
+    `crawler.engine.downloader.slots`, which doesn't exist until a
+    request has actually been scheduled) -- gracefully does nothing if
+    that isn't available yet, rather than raising. Slot lookup tries the
+    bare domain first, then falls back to a substring scan over slot
+    keys, since Scrapy doesn't guarantee the exact slot-key format is
+    the bare domain across every version/configuration (a custom
+    `download_slot` in `Request.meta` changes it, for instance) --
+    genuinely unmatched domains are silently skipped rather than
+    raising, so a project using custom slot keys everywhere simply gets
+    no adjustment rather than an error."""
+
+    def __init__(self, crawler: Any, window: int = 20, min_confidence: float = 0.7,
+                 factor: float = 2.0) -> None:
+        self.crawler = crawler
+        self.window = window
+        self.min_confidence = min_confidence
+        self.factor = factor
+        self._history: dict = {}
+        self._throttled_domains: set = set()
+
+    @classmethod
+    def from_crawler(cls, crawler: Any) -> "FlightAutoThrottleMiddleware":
+        settings = crawler.settings
+        return cls(
+            crawler,
+            window=settings.getint("NEXTFLIGHT_THROTTLE_WINDOW", 20),
+            min_confidence=settings.getfloat("NEXTFLIGHT_THROTTLE_MIN_CONFIDENCE", 0.7),
+            factor=settings.getfloat("NEXTFLIGHT_THROTTLE_FACTOR", 2.0),
+        )
+
+    def process_response(self, request: Any, response: Response, spider: Any) -> Response:
+        flight = _flight_property(response)
+        if flight.keys():
+            domain = _domain_of(response.url)
+            history = self._history.setdefault(domain, collections.deque(maxlen=self.window))
+            history.append(flight.parse_confidence()["score"])
+            if len(history) >= max(3, self.window // 2):
+                self._adjust_slot(domain, sum(history) / len(history))
+        return response
+
+    def _get_slot(self, domain: str) -> Any:
+        try:
+            slots = self.crawler.engine.downloader.slots
+        except AttributeError:
+            return None
+        if not slots:
+            return None
+        if domain in slots:
+            return slots[domain]
+        for key, slot in slots.items():
+            if domain in key:
+                return slot
+        return None
+
+    def _adjust_slot(self, domain: str, avg_confidence: float) -> None:
+        slot = self._get_slot(domain)
+        if slot is None or not hasattr(slot, "delay"):
+            return
+        should_throttle = avg_confidence < self.min_confidence
+        already_throttled = domain in self._throttled_domains
+        if should_throttle and not already_throttled:
+            slot.delay = (slot.delay * self.factor) if slot.delay else self.factor
+            self._throttled_domains.add(domain)
+        elif not should_throttle and already_throttled:
+            if slot.delay:
+                slot.delay = slot.delay / self.factor
+            self._throttled_domains.discard(domain)
+
+
+class NextflightSpiderMiddleware:
+    """Spider middleware that fires the `schema_drift` signal when a
+    response's nextflight parse confidence drops significantly below its
+    own running baseline for that domain -- an in-flight early-warning
+    path complementing `NextflightStatsExtension`'s end-of-crawl summary,
+    for a spider (or another extension) that wants to log/alert or
+    gracefully pause/stop instead of quietly ingesting degraded data for
+    the rest of the run.
+
+    Enable via::
+
+        SPIDER_MIDDLEWARES = {"nextflight.scrapy_middleware.NextflightSpiderMiddleware": 543}
+        NEXTFLIGHT_DRIFT_MIN_SAMPLES = 5    # baseline needs at least this many responses first
+        NEXTFLIGHT_DRIFT_THRESHOLD = 0.3    # signal fires when confidence drops at least this far below baseline
+
+    Connect to the signal like any other::
+
+        crawler.signals.connect(on_schema_drift, signal=schema_drift)
+
+        def on_schema_drift(domain, confidence, baseline, response, spider):
+            spider.logger.warning(
+                f"{domain}: confidence dropped to {confidence:.2f} (baseline {baseline:.2f})"
+            )
+
+    The baseline is a simple running mean per domain, seeded from the
+    first `NEXTFLIGHT_DRIFT_MIN_SAMPLES` responses before the check
+    starts firing at all -- so a site this library never parses
+    perfectly to begin with doesn't spuriously "drift" relative to its
+    own already-imperfect starting point; only a real *drop from where
+    this same site already was* fires the signal."""
+
+    def __init__(self, crawler: Any, min_samples: int = 5, threshold: float = 0.3) -> None:
+        self.crawler = crawler
+        self.min_samples = min_samples
+        self.threshold = threshold
+        self._counts: dict = {}
+        self._sums: dict = {}
+
+    @classmethod
+    def from_crawler(cls, crawler: Any) -> "NextflightSpiderMiddleware":
+        settings = crawler.settings
+        return cls(
+            crawler,
+            min_samples=settings.getint("NEXTFLIGHT_DRIFT_MIN_SAMPLES", 5),
+            threshold=settings.getfloat("NEXTFLIGHT_DRIFT_THRESHOLD", 0.3),
+        )
+
+    def process_spider_input(self, response: Response, spider: Any) -> None:
+        flight = _flight_property(response)
+        if not flight.keys():
+            return None
+        domain = _domain_of(response.url)
+        confidence = flight.parse_confidence()["score"]
+        count = self._counts.get(domain, 0)
+        total = self._sums.get(domain, 0.0)
+        if count >= self.min_samples:
+            baseline = total / count
+            if baseline - confidence >= self.threshold:
+                self.crawler.signals.send_catch_log(
+                    signal=schema_drift, domain=domain, confidence=confidence,
+                    baseline=baseline, response=response, spider=spider,
+                )
+        self._counts[domain] = count + 1
+        self._sums[domain] = total + confidence
+        return None
 
 
 def recommended_settings(*, streaming: bool = False, rsc: bool = False,
@@ -880,6 +1083,47 @@ class FlightItemPipeline:
             return []
         flight = _flight_property(response)
         return flight.find_all_by_keys(self.required_keys, dedupe=self.dedupe)
+
+
+NEXTFLIGHT_META_KEY = "nextflight"
+
+
+def build_action_meta(action_id: str, router_state_tree: Optional[str] = None, **extra: Any) -> dict:
+    """Build the `meta={"nextflight": {...}}` dict for the documented
+    convention of passing Server Action context (`action_id`,
+    `router_state_tree`, and anything else a spider needs) between a
+    `Request` and the `Response` its callback receives, instead of
+    smuggling it through spider instance attributes -- the idiomatic
+    shape for a multi-step action-chasing spider that isn't using
+    `FlightSession` (which handles this internally instead)::
+
+        yield scrapy.Request(
+            response.url, method="POST",
+            meta=build_action_meta(action_id, router_state_tree, cursor=cursor),
+            callback=self.parse_next_page,
+        )
+
+        def parse_next_page(self, response):
+            ctx = read_action_meta(response)
+            action_id, cursor = ctx["action_id"], ctx["cursor"]
+
+    Read it back on the other end with :func:`read_action_meta`. Any
+    `**extra` keyword arguments (e.g. `cursor=`) are merged in alongside
+    `action_id`/`router_state_tree`, so a spider isn't limited to just
+    those two fields."""
+    meta = {"action_id": action_id, "router_state_tree": router_state_tree}
+    meta.update(extra)
+    return {NEXTFLIGHT_META_KEY: meta}
+
+
+def read_action_meta(response_or_request: Any) -> dict:
+    """Read back the dict built by :func:`build_action_meta` from a
+    `Request`'s or `Response`'s `.meta`. Returns `{}` (not `None`, not a
+    `KeyError`) when nothing was set, so a callback can chain
+    `.get("action_id")` immediately without a separate `None`-check for
+    the "this request wasn't part of an action chain" case."""
+    meta = getattr(response_or_request, "meta", None) or {}
+    return meta.get(NEXTFLIGHT_META_KEY, {})
 
 
 class NextflightSpiderMixin:

@@ -181,7 +181,7 @@ def test_middleware_caches_version_hint_per_domain():
     assert len(mw._version_hint_cache) == 1
 
     hint_other = mw.version_hint_for_response(resp_other)
-    assert hint_other == {"range": None, "notes": None, "matches": []}
+    assert hint_other == {"range": None, "notes": None, "matches": [], "bundler": "unknown"}
     assert len(mw._version_hint_cache) == 2
     pipeline = FlightItemPipeline(required_keys=["title", "price"])
     resp = HtmlResponse(

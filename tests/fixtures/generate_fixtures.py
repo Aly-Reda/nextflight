@@ -79,6 +79,18 @@ FIXTURES = {
             '3:{"id":42}',
         )
     ),
+    # Not tied to a specific Next.js version -- exercises 0.4.5's
+    # streaming/PPR visibility (items 4/5): a static shell in the first
+    # push() call referencing an async placeholder ("$@2") whose data
+    # arrives in a second, separate push() call.
+    "streaming-ppr-0.4.5": (
+        _push(
+            '0:["$","div",null,{"children":["$","section",null,{"children":"$@2"}]}]',
+            '1:{"title":"Product F","price":5999}',
+        )
+        + '<script>self.__next_f.push([1,"2:{\\"reviews\\":[\\"$4\\"],\\"streamedAt\\":\\"$D2024-06-01T00:00:00.000Z\\"}"])</script>'
+        + '<script>self.__next_f.push([1,"4:{\\"author\\":\\"B. Reviewer\\",\\"rating\\":4}"])</script>'
+    ),
 }
 
 

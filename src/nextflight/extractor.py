@@ -386,6 +386,27 @@ def _read_urllib_response_text(resp) -> str:
     return raw.decode(charset, errors="replace")
 
 
+_BUNDLER_MARKERS = (
+    ("turbopack", ("__turbopack_require__", "__turbopack_context__", "/_next/static/chunks/[turbopack]")),
+    ("webpack", ("__webpack_require__", "webpackChunk_N_E", "self.webpackChunk")),
+)
+
+
+def _detect_bundler(html: str) -> str:
+    """Best-effort guess at which bundler produced a page's chunks --
+    `"webpack"`, `"turbopack"`, or `"unknown"` -- based on runtime
+    identifier strings each bundler's output leaves in the page. Used by
+    :meth:`FlightExtractor.next_version_hint` so a `parse_confidence()`
+    drop caused by a bundler switch (a real, if uncommon, event -- e.g.
+    a project opting into Turbopack for dev or, in Next.js 15+, for
+    production builds) can be correctly attributed to that instead of
+    being mistaken for an actual wire-format break."""
+    for name, markers in _BUNDLER_MARKERS:
+        if any(marker in html for marker in markers):
+            return name
+    return "unknown"
+
+
 class FlightExtractor:
     """Parses and searches the Next.js Flight payloads embedded in a page.
 
@@ -455,6 +476,11 @@ class FlightExtractor:
         # ratio after the first call.
         self._cache_hits = 0
         self._cache_misses = 0
+        # Cache for `_push_call_index_map()` / `streamed_chunks()` -- see
+        # that method's docstring. `None` means "not computed yet",
+        # distinct from an empty `dict` (a page with a single push call,
+        # nothing streamed), so it's only ever built once.
+        self._push_call_index_cache: Optional[dict] = None
         # Lazily-decoded view over each chunk's raw JSON -- see
         # _LazyRawChunks and _materialize_chunk. The raw row text and row
         # kind are what actually get populated during parsing (cheap);
@@ -1769,6 +1795,101 @@ class FlightExtractor:
             "resolve_cache_misses": self._cache_misses,
         }
 
+    def _push_call_index_map(self) -> dict:
+        """Cached mapping of `chunk_id -> index` of the `self.__next_f
+        .push(...)` call (0-based, in document order) it first appears
+        in -- the basis for :meth:`streamed_chunks`. Computed once per
+        instance and cached, since it requires a full pass over every
+        push call's raw text (`_split_rows` per call), same cost class as
+        the eager materialization `parse_confidence()` already triggers.
+
+        This relies on a real, if informal, invariant of how Next.js
+        emits Flight data: the *first* `push()` call carries the initial
+        SSR shell (everything ready before any `<Suspense>` boundary had
+        to wait), and each subsequent, separate `push()` call is
+        appended to the document only once its corresponding boundary's
+        data becomes ready -- so a chunk's presence in call index 0 vs.
+        a later index reflects genuine arrival order, not just
+        incidental ordering, even when parsing an already-complete,
+        fully-buffered page rather than a live stream."""
+        if self._push_call_index_cache is None:
+            index_map: dict = {}
+            for call_index, payload in enumerate(self._iter_push_payloads()):
+                for chunk_id, _row_type, _raw_value, _pre in self._split_rows(payload):
+                    index_map.setdefault(chunk_id, call_index)
+            self._push_call_index_cache = index_map
+        return self._push_call_index_cache
+
+    def streamed_chunks(self) -> list:
+        """Chunk ids that arrived after the initial shell -- i.e. in a
+        `self.__next_f.push(...)` call other than the first one on the
+        page -- distinguishing "was present in the initial HTML" from
+        "arrived later via streaming" once a `<Suspense>` boundary's data
+        became ready. Useful for a scraper that wants to know whether it
+        needs to wait/poll for slower-loading data, versus data that's
+        guaranteed present in the very first response.
+
+        Returns ids in the order they first appear in `.keys()` (page
+        order), not grouped by which push call they arrived in -- use
+        :meth:`is_ppr_page`/:meth:`static_vs_dynamic_chunks` instead if
+        what's actually wanted is a static/dynamic split rather than an
+        arrival-order one; the two are related but not identical
+        concepts (PPR's static shell and the streaming shell aren't
+        always the same boundary set).
+
+        This is a best-effort inference from `push()` call boundaries in
+        the already-fully-buffered HTML (see `_push_call_index_map`'s
+        docstring for why that's reliable), not a live measurement --
+        for a genuinely live stream where exact timing matters, use
+        `from_stream()` instead, which yields chunks as they actually
+        arrive."""
+        boundaries = self._push_call_index_map()
+        return [cid for cid in self.raw_chunks if boundaries.get(cid, 0) > 0]
+
+    def is_ppr_page(self) -> bool:
+        """Best-effort detector for a Partial Prerendering (PPR) page --
+        one that mixes a static shell with dynamic "holes" filled in at
+        request time. There's no single definitive wire-format marker
+        for PPR (it's a rendering strategy, not a distinct payload
+        format), so this checks for the combination of signals that, in
+        practice, only co-occur on a PPR page: more than one `push()`
+        call (i.e. :meth:`streamed_chunks` is non-empty -- something
+        streamed in after an initial shell) *and* at least one chunk
+        resolving through an async placeholder marker (`$@<id>`) in the
+        raw, unresolved row text -- PPR's dynamic holes are wired up
+        through the same Suspense/streaming machinery as an ordinary
+        `loading.tsx` boundary, so this can't perfectly distinguish "PPR"
+        from "an ordinary streamed page with a real Suspense boundary"
+        in every case; treat a `True` result as "likely PPR or at least
+        genuinely streamed," not as a certainty."""
+        if not self.streamed_chunks():
+            return False
+        for chunk_id in self._row_types:
+            raw_text = self._raw_row_text.get(chunk_id, "")
+            if isinstance(raw_text, str) and re.search(r'"\$@\d+"', raw_text):
+                return True
+        return False
+
+    def static_vs_dynamic_chunks(self) -> dict:
+        """Split chunk ids into `{"static": [...], "dynamic": [...]}`,
+        using :meth:`streamed_chunks` as the split point -- chunks
+        present in the page's very first `push()` call are treated as
+        the static shell (safe to cache aggressively across requests to
+        the same route), everything that arrived in a later `push()`
+        call as dynamically rendered per-request content (re-fetch on
+        every request). This is the same underlying signal as
+        :meth:`streamed_chunks`, just returned as a ready-made two-way
+        split instead of a single list, for a crawler that specifically
+        wants to treat the two groups differently (e.g. cache one, skip
+        re-parsing the other) rather than just knowing which ids are
+        which."""
+        streamed = set(self.streamed_chunks())
+        static: list = []
+        dynamic: list = []
+        for cid in self.raw_chunks:
+            (dynamic if cid in streamed else static).append(cid)
+        return {"static": static, "dynamic": dynamic}
+
     def is_fallback_skeleton(self) -> bool:
         """Heuristic check for an ISR `fallback: true`/`'blocking'`
         loading skeleton -- a first request to a not-yet-generated path
@@ -1856,27 +1977,36 @@ class FlightExtractor:
         registry (see that file for the underlying, citable reference).
 
         Returns ``{"range": str | None, "notes": str | None, "matches":
-        [str, ...]}`` -- `matches` lists every candidate range whose
-        markers were found, since marker sets can overlap between
-        adjacent versions; `range`/`notes` are simply the last (i.e. most
-        recent) match, a reasonable default when several match. Returns
-        an all-``None``/empty result if no known markers were found at
-        all -- not an error, just "this library doesn't have a fingerprint
-        for whatever produced this page yet." Parsing itself does not
-        depend on this result; it degrades gracefully either way."""
+        [str, ...], "bundler": str}`` -- `matches` lists every candidate
+        range whose markers were found, since marker sets can overlap
+        between adjacent versions; `range`/`notes` are simply the last
+        (i.e. most recent) match, a reasonable default when several
+        match. `bundler` (**new in 0.4.6**) is `"webpack"`, `"turbopack"`,
+        or `"unknown"` -- distinguishing the two matters because they can
+        produce structurally different chunk naming, which would
+        otherwise show up as a `parse_confidence()` drop that looks like
+        a wire-format break but is really just a bundler switch (e.g. a
+        project opting into Turbopack). Returns an all-``None``/empty
+        `range`/`notes`/`matches` (bundler is still checked and reported)
+        if no known version markers were found at all -- not an error,
+        just "this library doesn't have a version fingerprint for
+        whatever produced this page yet." Parsing itself does not depend
+        on this result; it degrades gracefully either way."""
         registry = _load_known_formats()
         matches = []
         for entry in registry:
             markers = entry.get("markers") or []
             if markers and all(marker in self.html for marker in markers):
                 matches.append(entry)
+        bundler = _detect_bundler(self.html)
         if not matches:
-            return {"range": None, "notes": None, "matches": []}
+            return {"range": None, "notes": None, "matches": [], "bundler": bundler}
         best = matches[-1]
         return {
             "range": best.get("range"),
             "notes": (best.get("notes") or "").strip() or None,
             "matches": [m.get("range") for m in matches],
+            "bundler": bundler,
         }
 
     def suggest_similar_keys(self, required_keys: Iterable[str], *, cutoff: float = 0.6,
@@ -2031,6 +2161,7 @@ class FlightExtractor:
         extractor._repair_outcomes = {}
         extractor._cache_hits = 0
         extractor._cache_misses = 0
+        extractor._push_call_index_cache = None
         seen_ids: set = set()
         for piece in chunks:
             if isinstance(piece, (bytes, bytearray)):
@@ -2241,6 +2372,93 @@ def find_page_props(html: Any) -> Optional[dict]:
 _SERVER_ACTION_ID_RE = re.compile(r'createServerReference\)\("([0-9a-f]{16,64})"')
 
 
+# ISO 639-1 two-letter language codes -- used by detect_locale() to avoid
+# treating an arbitrary two-letter path segment (a product SKU prefix, an
+# abbreviated category slug) as a locale just because it happens to be
+# the right shape. Not exhaustive of every possible locale a site could
+# invent, but covers the common case this function targets.
+_ISO_639_1_CODES = frozenset({
+    "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az",
+    "ba", "be", "bg", "bh", "bi", "bm", "bn", "bo", "br", "bs",
+    "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy",
+    "da", "de", "dv", "dz",
+    "ee", "el", "en", "eo", "es", "et", "eu",
+    "fa", "ff", "fi", "fj", "fo", "fr", "fy",
+    "ga", "gd", "gl", "gn", "gu", "gv",
+    "ha", "he", "hi", "ho", "hr", "ht", "hu", "hy", "hz",
+    "ia", "id", "ie", "ig", "ii", "ik", "io", "is", "it", "iu",
+    "ja", "jv",
+    "ka", "kg", "ki", "kj", "kk", "kl", "km", "kn", "ko", "kr", "ks", "ku", "kv", "kw", "ky",
+    "la", "lb", "lg", "li", "ln", "lo", "lt", "lu", "lv",
+    "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my",
+    "na", "nb", "nd", "ne", "ng", "nl", "nn", "no", "nr", "nv", "ny",
+    "oc", "oj", "om", "or", "os",
+    "pa", "pi", "pl", "ps", "pt",
+    "qu",
+    "rm", "rn", "ro", "ru", "rw",
+    "sa", "sc", "sd", "se", "sg", "si", "sk", "sl", "sm", "sn", "so", "sq", "sr", "ss", "st", "su", "sv", "sw",
+    "ta", "te", "tg", "th", "ti", "tk", "tl", "tn", "to", "tr", "ts", "tt", "tw", "ty",
+    "ug", "uk", "ur", "uz",
+    "ve", "vi", "vo",
+    "wa", "wo",
+    "xh",
+    "yi", "yo",
+    "za", "zh", "zu",
+})
+
+_HTML_LANG_RE = re.compile(r'<html[^>]+lang=["\']([a-zA-Z0-9_-]+)["\']', re.I)
+_LOCALE_PATH_SEGMENT_RE = re.compile(r'^/([a-zA-Z]{2}(?:-[a-zA-Z]{2,4})?)(?=/|$)')
+_LOCALE_SUBDOMAIN_RE = re.compile(r'^([a-zA-Z]{2})\.')
+_EMBEDDED_URL_RE = re.compile(r'https?://[^\s"\'<>]+')
+
+
+def detect_locale(html_or_url: Any) -> Optional[str]:
+    """Best-effort detection of a page's locale, checking three signals
+    in order of reliability:
+
+    1. The rendered `<html lang="...">` attribute -- the most reliable
+       signal when present, since it's Next.js's own (or the app's own)
+       stated locale rather than an inference from the URL shape.
+    2. A path-prefixed locale segment (`/en/...`, `/ar/...`), validated
+       against a list of ISO 639-1 language codes so an arbitrary
+       two-letter path segment (a SKU prefix, an abbreviated slug) isn't
+       mistaken for one.
+    3. A locale-coded subdomain (`en.example.com`), same validation.
+
+    `html_or_url` accepts an HTML string, a response-like object (its
+    `.text`/`.body` is checked for `<html lang>` and for an embedded
+    absolute URL to test against signals 2/3), or a bare URL string
+    directly. Returns the locale code as found (e.g. `"en"`, `"en-US"`,
+    `"pt-BR"`) preserving its original casing, or `None` if none of the
+    three signals matched. This is deliberately simple (per the common
+    `/en/` path-prefix pattern seen on most multi-region sites) rather
+    than a full BCP 47 validator -- a site using an unusual locale
+    scheme may need its own check."""
+    text = html_or_url if isinstance(html_or_url, str) else _coerce_html(html_or_url)
+
+    m = _HTML_LANG_RE.search(text)
+    if m:
+        return m.group(1)
+
+    url_match = _EMBEDDED_URL_RE.search(text)
+    candidate = url_match.group(0) if url_match else text
+    if "://" in candidate:
+        parsed = urllib.parse.urlsplit(candidate)
+        path, netloc = parsed.path, parsed.netloc
+    else:
+        path, netloc = candidate, ""
+
+    m = _LOCALE_PATH_SEGMENT_RE.match(path)
+    if m and m.group(1).split("-")[0].lower() in _ISO_639_1_CODES:
+        return m.group(1)
+
+    m = _LOCALE_SUBDOMAIN_RE.match(netloc)
+    if m and m.group(1).lower() in _ISO_639_1_CODES:
+        return m.group(1)
+
+    return None
+
+
 def find_server_action_ids(html: Any) -> list:
     """Find Next.js Server Action ids embedded in a page or JS chunk's
     text -- the hex ids bound via `createServerReference(...)` in the
@@ -2280,6 +2498,156 @@ def find_server_action_ids(html: Any) -> list:
             seen.add(action_id)
             ids.append(action_id)
     return ids
+
+
+_API_ROUTE_RE = re.compile(r'fetch\(\s*["\'](/api/[^"\'?\s]+)')
+
+
+def find_api_routes(html: Any) -> list:
+    """Scan a page or JS chunk's raw text for `fetch("/api/...")`-shaped
+    calls to a Next.js App Router Route Handler (`app/api/.../route.ts`)
+    -- a separate mechanism from Server Actions: a plain REST-ish
+    endpoint, no `Next-Action` header required to call it. Rounds out
+    data-fetching discovery alongside :func:`find_server_action_ids` and
+    :func:`find_next_chunk_urls`.
+
+    This is deliberately a plain regex over raw text, not part of the
+    Flight/`$`-ref parsing machinery -- these calls live in ordinary (if
+    minified) client JavaScript, not in a `self.__next_f.push` row.
+    Query strings are stripped from results (the route itself is what
+    matters for discovery; a specific call's query params usually aren't
+    reusable as-is). Returns distinct paths in the order found; an empty
+    list if none are present, which is the common case for a site that
+    only fetches data server-side (already embedded in the Flight
+    payload) rather than via a client-side call to its own API route."""
+    html = _coerce_html(html)
+    seen: set = set()
+    routes: list = []
+    for m in _API_ROUTE_RE.finditer(html):
+        route = m.group(1)
+        if route not in seen:
+            seen.add(route)
+            routes.append(route)
+    return routes
+
+
+_ROUTE_SLOT_KEY_RE = re.compile(r"^@[A-Za-z0-9_-]+$")
+_INTERCEPTING_ROUTE_RE = re.compile(r"^\((?:\.{1,3}|\.\.\)\(\.\.)\)$")
+
+
+def is_route_slot_key(key: Any) -> bool:
+    """Whether `key` looks like an App Router parallel-route slot name
+    (`@modal`, `@analytics`, ...) rather than an ordinary data field.
+
+    **This does not gate what `find_by_keys()`/`find_all()`/
+    `resolve_all()` can see** -- those already walk into a slot's nested
+    content transparently, the same as any other dict value, since they
+    recurse by *value* rather than by key name. There's no separate
+    "slot-aware" search mode to opt into; a `find_by_keys({"price"})`
+    call already finds `price` whether it's nested under an ordinary key
+    or a `@modal` slot. This helper is for the opposite direction --
+    telling a slot key apart from a real data field when *displaying*
+    `.shape()` output or writing code that specifically needs to know
+    "is this key a parallel-route slot.\""""
+    return isinstance(key, str) and bool(_ROUTE_SLOT_KEY_RE.match(key))
+
+
+def is_intercepting_route_segment(segment: Any) -> bool:
+    """Whether a route segment string looks like an App Router
+    intercepting-route convention marker -- `(.)`, `(..)`, `(...)`, or
+    the two-level `(..)(..)` form -- rather than an ordinary path
+    segment. Like :func:`is_route_slot_key`, this is for *identifying*
+    the convention (e.g. for a diagnostic tool or `.shape()`-style
+    display), not a gate on search: these segments are just ordinary
+    string keys/values to every `find_*`/`resolve_*` method already."""
+    return isinstance(segment, str) and bool(_INTERCEPTING_ROUTE_RE.match(segment))
+
+
+_OG_META_RE = re.compile(
+    r'<meta\s+(?:property|name)=["\'](og:[\w:.-]+|twitter:[\w:.-]+)["\']\s+content=["\']([^"\']*)["\']',
+    re.I,
+)
+_OG_META_RE_REVERSED = re.compile(
+    r'<meta\s+content=["\']([^"\']*)["\']\s+(?:property|name)=["\'](og:[\w:.-]+|twitter:[\w:.-]+)["\']',
+    re.I,
+)
+
+
+def find_meta_tags(html: Any) -> dict:
+    """Extract Open Graph (`og:*`) and Twitter Card (`twitter:*`)
+    `<meta>` tags into a flat dict, e.g. `{"og:title": "...",
+    "og:image": "...", "twitter:card": "summary_large_image"}` -- a third
+    structured-data fallback source (Flight -> JSON-LD -> meta tags)
+    alongside :func:`find_json_ld`. Listing/product sites often duplicate
+    title/image/price data in these tags for social-preview purposes,
+    which is useful when the Flight data is incomplete or a specific
+    field is missing from it.
+
+    Handles both common attribute orders (`property`/`name` before
+    `content`, or after) since real-world markup isn't consistent about
+    it. Returns an empty dict (not an error) if no matching tags are
+    present. When both orders somehow set the same property (unusual),
+    the first occurrence in document order wins."""
+    html = _coerce_html(html)
+    tags: dict = {}
+    for m in _OG_META_RE.finditer(html):
+        tags.setdefault(m.group(1).lower(), m.group(2))
+    for m in _OG_META_RE_REVERSED.finditer(html):
+        tags.setdefault(m.group(2).lower(), m.group(1))
+    return tags
+
+
+def discover_urls_from_sitemap(base_url: str, session: Any = None, *, timeout: float = 15.0,
+                                _depth: int = 0, _max_depth: int = 3) -> list:
+    """Fetch a sitemap and return every `<loc>` URL in it, following one
+    level of `<sitemapindex>` nesting automatically -- the most reliable
+    way to seed `start_urls` for a full-site crawl on an App Router site
+    that generates its sitemap dynamically (`app/sitemap.ts`). This is
+    plain XML, not Flight data, but sits alongside this library's other
+    fetch helpers since it solves the same "don't hand-roll this per
+    project" problem.
+
+    `base_url`: either the site's origin (`"https://example.com"` --
+    `/sitemap.xml` is appended automatically) or a direct sitemap/
+    sitemap-index URL (anything ending in `.xml` is used as-is).
+
+    `session`, if given, is anything exposing a `requests.Session`-
+    compatible `.get(url, timeout=)` method returning a response with
+    `.text`. Omitted (the default), the stdlib (`urllib.request`) is used
+    instead -- no hard dependency on `requests`. Pure `xml.etree`, no new
+    dependency either way.
+
+    Returns an empty list (not an error) if the sitemap can't be fetched
+    or parsed at all -- a missing or malformed sitemap shouldn't take
+    down a crawl that has other ways to discover URLs (following links,
+    a known listing-index page, etc.)."""
+    import xml.etree.ElementTree as ET
+
+    url = base_url if base_url.rstrip("/").lower().endswith(".xml") else f"{base_url.rstrip('/')}/sitemap.xml"
+    try:
+        if session is not None:
+            resp = session.get(url, timeout=timeout)
+            text = resp.text
+        else:
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (nextflight)"})
+            with urllib.request.urlopen(request, timeout=timeout) as resp_obj:
+                text = _read_urllib_response_text(resp_obj)
+        root = ET.fromstring(text)
+    except Exception:
+        return []
+
+    def _local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    locs = [el.text.strip() for el in root.iter() if _local_name(el.tag) == "loc" and el.text]
+    if _local_name(root.tag) == "sitemapindex" and _depth < _max_depth:
+        urls: list = []
+        for loc in locs:
+            urls.extend(discover_urls_from_sitemap(
+                loc, session, timeout=timeout, _depth=_depth + 1, _max_depth=_max_depth,
+            ))
+        return urls
+    return locs
 
 
 _NEXT_CHUNK_SRC_RE = re.compile(r'src="([^"]*/_next/static/chunks/[^"]+\.js)"')
