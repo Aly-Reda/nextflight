@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.4.3
+
+Closes the P1 "silent wrong data" / misclassification traps identified
+alongside 0.4.2's P0 set — deployment/rendering-mode edge cases and
+response-header signals that otherwise look identical to a genuine parse
+failure, plus the missing `basePath`/multi-zone handling that silently
+no-ops `find_next_chunk_urls()` on any non-default-configured site.
+
+### New: deployment/rendering-mode detection
+
+- `detect_next_router()` now returns `"static_export"` (a new, distinct
+  value) for `output: 'export'` builds — a Pages Router export via its
+  `__NEXT_DATA__.nextExport: true` flag, an App Router export via a
+  chunk-URL fingerprint when neither Flight nor `__NEXT_DATA__` is
+  present at all. Parsing "failure" against a static-export page isn't a
+  bug; this lets a spider branch cleanly instead of misreading it as one.
+- `FlightExtractor.is_fallback_skeleton() -> bool`: heuristic detection
+  of an ISR `fallback: true`/`'blocking'` cold-path loading skeleton — a
+  page that parses with full confidence but resolves to almost no data,
+  easily confused with "the format broke" by `parse_confidence()` alone.
+- `detect_draft_mode(response) -> bool`: checks for Next.js Draft Mode's
+  `__prerender_bypass`/`__next_preview_data` cookies, which silently
+  bypass the ISR cache for every subsequent request on a session that
+  picks one up. `FlightSession` now strips these automatically after
+  every `.get()` (`strip_draft_cookies=True`, the default); `FlightMiddleware`
+  gained the matching `NEXTFLIGHT_STRIP_DRAFT_COOKIES` setting (also
+  default `True` — see its docstring for a priority-ordering caveat
+  relative to Scrapy's `CookiesMiddleware`).
+
+### New: response-header helpers
+
+- `get_cache_status(response) -> dict`: surfaces `x-nextjs-cache`
+  (`HIT`/`MISS`/`STALE`) plus `Cache-Control`'s `s-maxage`/
+  `stale-while-revalidate` and the `Age` header, for smarter re-fetch
+  scheduling in `diff_pages`/`--watch` workflows.
+- `detect_middleware_rewrite(response) -> str | None`: reads
+  `x-middleware-rewrite`/`x-nextjs-rewrite` to surface the real URL a
+  response was silently rewritten to serve, so a crawler doesn't store
+  data under the wrong logical URL.
+- `get_rate_limit_headers(response) -> dict`: `Retry-After`/
+  `X-RateLimit-Remaining`/`X-RateLimit-Reset` (or `RateLimit-*`
+  equivalents) in one call.
+- `get_edge_geo_headers(response) -> dict`: Vercel's
+  `x-vercel-ip-country`/`-city`/`-region` headers in one call, for
+  logging which geo variant of a page a crawl actually received.
+- `find_error_digest(html) -> str | None`: extracts a Server Component
+  error's `digest` correlation id from a rendered error page, for
+  logging `"parse failed, digest=..."` instead of just "empty page."
+
+### New: pagination and `basePath`/multi-zone support
+
+- `find_pagination_action(page) -> dict | None`: finds the common
+  cursor-pagination shape (`hasNextPage`, `cursor`/`endCursor`/
+  `nextCursor`) via `find_by_keys` under the hood, pre-packaged so each
+  project doesn't reinvent this detection per site.
+- `find_next_chunk_urls()` gained a `base_path=` filter argument and now
+  matches chunk URLs under *any* prefix by default (previously it only
+  matched a bare `/_next/...` path and silently returned nothing at all
+  on a site using `next.config.js`'s `basePath` or a multi-zone
+  deployment). `detect_base_path(html) -> str` auto-detects the prefix in
+  use.
+
+All backward compatible. `find_next_chunk_urls()`'s broadened default
+match is additive (more sites now return results instead of an empty
+list) rather than a behavior change for sites it already worked on.
+
 ## 0.4.2
 
 Closes the biggest functional/correctness gaps identified in a review of

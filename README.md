@@ -327,6 +327,7 @@ around the raw-string encoding yourself, either update that code or pass
 | `.shape(chunk_id=None, max_depth=3)` | structure summary | Key names + value types, not values — get a feel for a new site fast |
 | `.stats()` | `dict` | Chunk count, row-kind breakdown, page size |
 | `.parse_confidence()` | `dict` | Score + breakdown of cleanly-parsed vs. raw-fallback vs. repaired chunks |
+| `.is_fallback_skeleton()` | `bool` | **New in 0.4.3.** Heuristic: looks like an ISR `fallback:true`/`'blocking'` cold-path loading skeleton rather than a real content page |
 | `.next_version_hint()` | `dict` | Best-effort guess at which Next.js version range produced this payload |
 
 **Resolving data** (dereferencing `$`-refs)
@@ -414,8 +415,37 @@ identity` request.
 - **`find_next_chunk_urls(html, pattern=None) -> list`** — find
   `/_next/static/chunks/*.js` bundle URLs referenced by a page, e.g. to
   locate the chunk a server action id is defined in.
-- **`detect_next_router(html) -> str`** — `"app"`, `"pages"`, `"both"`, or
-  `"unknown"`. Run this first if you're not sure which extractor to use.
+- **`detect_next_router(html) -> str`** — `"app"`, `"pages"`, `"both"`,
+  `"static_export"` (**new in 0.4.3**), or `"unknown"`. Run this first if
+  you're not sure which extractor to use — `"static_export"` means
+  there's no server-rendered data payload to parse at all, by design, not
+  a parse failure.
+- **`detect_base_path(html) -> str`** — **new in 0.4.3.** Best-effort
+  detection of a `next.config.js` `basePath` (or multi-zone rewrite
+  prefix), e.g. `"/docs"` for a site whose chunks live under
+  `/docs/_next/static/...`. Returns `""` for a default-configured site.
+- **`find_pagination_action(page) -> dict | None`** — **new in 0.4.3.**
+  Finds the common cursor-pagination shape (`hasNextPage`,
+  `cursor`/`endCursor`/`nextCursor`) anywhere in a page's Flight data.
+  `page` accepts a `FlightExtractor` or raw HTML.
+- **`detect_middleware_rewrite(response) -> str | None`** — **new in
+  0.4.3.** Reads `x-middleware-rewrite`/`x-nextjs-rewrite` to surface the
+  real URL a response was silently rewritten to serve by Next.js Edge
+  Middleware.
+- **`get_cache_status(response) -> dict`** — **new in 0.4.3.** Surfaces
+  `x-nextjs-cache` plus `Cache-Control`'s `s-maxage`/
+  `stale-while-revalidate` and `Age` in one call.
+- **`get_rate_limit_headers(response) -> dict`** — **new in 0.4.3.**
+  `Retry-After`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` in one call.
+- **`get_edge_geo_headers(response) -> dict`** — **new in 0.4.3.**
+  Vercel's `x-vercel-ip-country`/`-city`/`-region` headers in one call.
+- **`detect_draft_mode(response) -> bool`** — **new in 0.4.3.** Checks
+  for Next.js Draft Mode's `__prerender_bypass`/`__next_preview_data`
+  cookies — picking one up silently bypasses the ISR cache for every
+  later request on the same session.
+- **`find_error_digest(html) -> str | None`** — **new in 0.4.3.**
+  Extracts a Server Component error's `digest` correlation id from a
+  rendered error page, for more actionable failure logging.
 - **`diff_pages(old, new, id_key=None) -> dict`** — module-level form of
   `.diff()`.
 - **`call_server_action(url, action_id, args=(), *, router_state_tree, session=None, headers=None, cookies=None, timeout=15.0) -> FlightExtractor`**

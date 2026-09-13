@@ -1769,6 +1769,46 @@ class FlightExtractor:
             "resolve_cache_misses": self._cache_misses,
         }
 
+    def is_fallback_skeleton(self) -> bool:
+        """Heuristic check for an ISR `fallback: true`/`'blocking'`
+        loading skeleton -- a first request to a not-yet-generated path
+        that returns HTTP 200 with a near-empty loading placeholder
+        instead of real content. Easily confused with "the format broke"
+        by `parse_confidence()`, which scores this page as perfectly
+        clean (every row *is* valid JSON) even though there's
+        essentially no data on it -- the two signals are checking
+        different things and neither alone tells the whole story.
+
+        There's no universal wire-format marker for this state -- it's a
+        loading UI a specific app renders, not a Next.js primitive -- so
+        this is deliberately a coarse heuristic: a page that parses with
+        full confidence but resolves to only a handful of total keys/
+        items across all of its JSON chunks combined. Real listing/
+        product pages almost always carry more structured data than
+        that; a page this sparse that still parsed perfectly is a
+        stronger signal of "nothing rendered yet" than of "a small page
+        that's just naturally simple," but false positives are possible
+        on a genuinely minimal page (e.g. a bare confirmation screen) --
+        treat this as a hint to retry-after-a-delay, not a certainty.
+
+        Wire into `FlightRetryMiddleware`-style logic as: treat a
+        skeleton hit as "retry after N seconds" rather than "low
+        confidence, retry immediately," since an immediate retry likely
+        hits the same unfinished generation."""
+        json_keys = self.json_keys()
+        if not json_keys:
+            return False
+        if self.parse_confidence()["score"] < 0.99:
+            return False  # a real parse problem, not a skeleton -- different signal
+        total_items = 0
+        for cid in json_keys:
+            resolved = self.resolve_chunk(cid)
+            if isinstance(resolved, (dict, list)):
+                total_items += len(resolved)
+            else:
+                total_items += 1
+        return total_items <= 2
+
     def parse_confidence(self) -> dict:
         """A score/summary of how cleanly this page's rows parsed, so you
         can flag pages that need investigation instead of manually
@@ -2242,10 +2282,30 @@ def find_server_action_ids(html: Any) -> list:
     return ids
 
 
-_NEXT_CHUNK_SRC_RE = re.compile(r'src="(/_next/static/chunks/[^"]+\.js)"')
+_NEXT_CHUNK_SRC_RE = re.compile(r'src="([^"]*/_next/static/chunks/[^"]+\.js)"')
 
 
-def find_next_chunk_urls(html: Any, *, pattern: Optional[Any] = None) -> list:
+def detect_base_path(html: Any) -> str:
+    """Best-effort detection of a site's `next.config.js` `basePath` (or
+    a multi-zone rewrite prefix) -- the part of the URL that comes
+    *before* `/_next/...` in asset paths, e.g. `"/docs"` for a site whose
+    chunks are served from `/docs/_next/static/chunks/...`. Returns `""`
+    (no prefix) for an ordinary default-configured site, which is also
+    what's returned if no `/_next/static/chunks/*.js` reference is found
+    at all -- this is a heuristic based on the *first* such reference
+    seen, not a guarantee, so a mid-migration or genuinely multi-zone
+    page mixing more than one prefix may not be handled perfectly."""
+    html = _coerce_html(html)
+    m = _NEXT_CHUNK_SRC_RE.search(html)
+    if not m:
+        return ""
+    full = m.group(1)
+    idx = full.find("/_next/static/chunks/")
+    return full[:idx]
+
+
+def find_next_chunk_urls(html: Any, *, pattern: Optional[Any] = None,
+                          base_path: Optional[str] = None) -> list:
     """Find `/_next/static/chunks/*.js` script URLs referenced by a page
     -- useful for locating the specific bundle a page's server action ids
     or other build-time-generated identifiers live in (see
@@ -2255,24 +2315,314 @@ def find_next_chunk_urls(html: Any, *, pattern: Optional[Any] = None) -> list:
     `pattern`: an additional regex (str or compiled) the URL itself must
     match, e.g. a route-specific chunk naming pattern -- omit to get
     every chunk URL referenced by the page, which is usually dozens and
-    mostly irrelevant to any one task. Returns root-relative URLs
-    (``/_next/static/...``) in the order found; resolve against the
-    page's own URL yourself (e.g. `response.urljoin(url)` in Scrapy)."""
+    mostly irrelevant to any one task.
+
+    `base_path`: restrict results to URLs under this prefix -- needed on
+    a site using `next.config.js`'s `basePath`, or a multi-zone
+    deployment (several Next.js apps behind one domain via rewrites),
+    where assets aren't served under a plain `/_next/...` path and more
+    than one prefix might appear on the same page. Leave as `None`
+    (default) to return every chunk URL found regardless of prefix --
+    which, as of this version, includes the prefix itself where present
+    (e.g. `"/docs/_next/static/chunks/123.js"`), unlike earlier versions
+    that only matched a bare `/_next/...` path and silently returned
+    nothing at all for a non-default `basePath`. Use
+    :func:`detect_base_path` first if you need to know the prefix in use
+    without hardcoding it.
+
+    Returns URLs (root-relative, prefix included when present) in the
+    order found; resolve against the page's own URL yourself (e.g.
+    `response.urljoin(url)` in Scrapy)."""
     html = _coerce_html(html)
     compiled = None
     if pattern is not None:
         compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+    normalized_base = base_path.rstrip("/") if base_path is not None else None
     seen: set = set()
     urls: list = []
     for m in _NEXT_CHUNK_SRC_RE.finditer(html):
         url = m.group(1)
         if url in seen:
             continue
+        if normalized_base is not None and not url.startswith(f"{normalized_base}/_next/"):
+            continue
         if compiled is not None and not compiled.search(url):
             continue
         seen.add(url)
         urls.append(url)
     return urls
+
+
+def detect_middleware_rewrite(response: Any) -> Optional[str]:
+    """Read Next.js Edge Middleware's rewrite/redirect signaling headers
+    to surface the *actual* URL a response was silently served for, so a
+    crawler doesn't store the response's data under the wrong logical
+    URL. `NextResponse.rewrite(...)` in middleware serves different
+    content at the *same* URL the crawler requested, with no HTTP
+    redirect for `requests`/Scrapy to follow -- only a response header
+    reveals it happened at all.
+
+    Checks (in order) `x-middleware-rewrite`, then `x-nextjs-rewrite` (an
+    older/alternate header name seen on some deployments). `response`
+    accepts anything exposing a `.headers` mapping (a `requests.Response`
+    or Scrapy `Response`) or a plain `dict` of headers directly. Returns
+    the rewritten URL, or `None` if neither header is present."""
+    headers = response if isinstance(response, dict) else getattr(response, "headers", None)
+    if headers is None:
+        return None
+    for name in ("x-middleware-rewrite", "x-nextjs-rewrite"):
+        value = _header_get(headers, name)
+        if value:
+            return value
+    return None
+
+
+def _header_get(headers: Any, name: str) -> Optional[str]:
+    """Case-insensitive header lookup that works across a plain `dict`
+    (any casing), `requests.Response.headers` (already
+    case-insensitive), and Scrapy's `Headers` (bytes keys/values,
+    case-insensitive `.get`). Tries a handful of common castings first
+    (cheap, no scan needed for the containers that are already
+    case-insensitive), then falls back to a linear case-insensitive scan
+    over `.items()` for a plain dict with unpredictable key casing."""
+    for candidate in (name, name.title(), name.upper(), name.lower(),
+                      name.encode("utf-8"), name.title().encode("utf-8")):
+        try:
+            value = headers.get(candidate)
+        except Exception:
+            continue
+        if value is not None:
+            if isinstance(value, (list, tuple)) and value:
+                value = value[0]
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            return value
+    try:
+        items = headers.items()
+    except Exception:
+        return None
+    target = name.lower()
+    for key, value in items:
+        key_str = key.decode("utf-8", errors="replace") if isinstance(key, bytes) else key
+        if key_str.lower() == target:
+            if isinstance(value, (list, tuple)) and value:
+                value = value[0]
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            return value
+    return None
+
+
+def get_cache_status(response: Any) -> dict:
+    """Surface Next.js's ISR/cache-related response headers in one call,
+    for smarter re-fetch scheduling in `diff_pages`/`--watch`-style
+    polling instead of hitting every URL on a fixed interval regardless
+    of whether it's actually due to change.
+
+    Returns a dict with:
+
+    - ``"cache"``: the `x-nextjs-cache` header value verbatim (typically
+      ``"HIT"``, ``"MISS"``, or ``"STALE"``), or `None` if absent (common
+      for non-Vercel deployments, which may not set this header at all).
+    - ``"s_maxage"`` / ``"stale_while_revalidate"``: parsed `int` values
+      from the `Cache-Control` header's `s-maxage=<n>` and
+      `stale-while-revalidate=<n>` directives, or `None` if not present.
+    - ``"age"``: the `Age` header as an `int` (seconds since the response
+      was generated at the cache), or `None`.
+
+    `response` accepts anything exposing a `.headers` mapping, or a plain
+    `dict` of headers directly."""
+    headers = response if isinstance(response, dict) else getattr(response, "headers", None)
+    cache_control = _header_get(headers, "cache-control") if headers is not None else None
+    result: dict[str, Any] = {
+        "cache": _header_get(headers, "x-nextjs-cache") if headers is not None else None,
+        "s_maxage": None,
+        "stale_while_revalidate": None,
+        "age": None,
+    }
+    if cache_control:
+        for directive, key in (("s-maxage", "s_maxage"), ("stale-while-revalidate", "stale_while_revalidate")):
+            m = re.search(rf"{directive}=(\d+)", cache_control)
+            if m:
+                result[key] = int(m.group(1))
+    if headers is not None:
+        age = _header_get(headers, "age")
+        if age is not None:
+            try:
+                result["age"] = int(age)
+            except ValueError:
+                pass
+    return result
+
+
+def get_rate_limit_headers(response: Any) -> dict:
+    """Surface common rate-limit-signaling response headers in one call
+    -- many sites (or the CDN/WAF in front of them) hint at an impending
+    block via headers before an outright 429/403, and this is the same
+    "read a few well-known headers into a plain dict" family as
+    :func:`get_cache_status`.
+
+    Returns a dict with ``"retry_after"`` (seconds, `int`, from
+    `Retry-After` -- HTTP-date values are left as the raw string since
+    parsing them isn't this function's job), ``"remaining"`` (from
+    `X-RateLimit-Remaining` or `RateLimit-Remaining`), and ``"reset"``
+    (from `X-RateLimit-Reset` or `RateLimit-Reset`) -- each `None` if not
+    present. `response` accepts anything exposing a `.headers` mapping,
+    or a plain `dict` of headers directly."""
+    headers = response if isinstance(response, dict) else getattr(response, "headers", None)
+    if headers is None:
+        return {"retry_after": None, "remaining": None, "reset": None}
+    retry_after: Any = _header_get(headers, "retry-after")
+    if retry_after is not None:
+        try:
+            retry_after = int(retry_after)
+        except ValueError:
+            pass  # HTTP-date form -- left as the raw string
+    remaining = _header_get(headers, "x-ratelimit-remaining") or _header_get(headers, "ratelimit-remaining")
+    reset = _header_get(headers, "x-ratelimit-reset") or _header_get(headers, "ratelimit-reset")
+    return {"retry_after": retry_after, "remaining": remaining, "reset": reset}
+
+
+def get_edge_geo_headers(response: Any) -> dict:
+    """Surface Vercel's Edge geolocation headers (used by many sites to
+    branch pricing/currency/inventory on apparent request origin) in one
+    call, so a crawl can log which geo variant of a page it actually
+    received. `response` accepts anything exposing a `.headers` mapping,
+    or a plain `dict` of headers directly. Returns a dict with
+    ``"country"``, ``"city"``, ``"region"`` -- each `None` if the
+    corresponding header isn't present (most non-Vercel deployments won't
+    set these at all)."""
+    headers = response if isinstance(response, dict) else getattr(response, "headers", None)
+    if headers is None:
+        return {"country": None, "city": None, "region": None}
+    return {
+        "country": _header_get(headers, "x-vercel-ip-country"),
+        "city": _header_get(headers, "x-vercel-ip-city"),
+        "region": _header_get(headers, "x-vercel-ip-region"),
+    }
+
+
+_DRAFT_MODE_COOKIE_NAMES = ("__prerender_bypass", "__next_preview_data")
+
+
+def _extract_cookie_names(response: Any) -> set:
+    """Best-effort extraction of cookie *names* present on/for a
+    response-like object, across a few different shapes: a plain
+    `dict`/`set`/`list` of names or name->value pairs, a
+    `requests.Response` (`.cookies` is an iterable of cookie objects with
+    `.name`, or a plain mapping), or a Scrapy `Response` (cookie names
+    only discoverable via `Set-Cookie` response headers, not a `.cookies`
+    attribute). Used by :func:`detect_draft_mode`."""
+    if isinstance(response, dict):
+        return set(response.keys())
+    if isinstance(response, (list, tuple, set, frozenset)):
+        return set(response)
+    names: set = set()
+    cookies_attr = getattr(response, "cookies", None)
+    if cookies_attr is not None:
+        try:
+            names.update(cookies_attr.keys())  # dict-like
+        except AttributeError:
+            try:
+                for c in cookies_attr:  # iterable of Cookie-like objects
+                    name = getattr(c, "name", None)
+                    if name:
+                        names.add(name)
+            except TypeError:
+                pass
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        set_cookie_values = []
+        getlist = getattr(headers, "getlist", None)
+        if callable(getlist):
+            for key in ("Set-Cookie", b"Set-Cookie"):
+                try:
+                    values = getlist(key)
+                except Exception:
+                    values = None
+                if values:
+                    set_cookie_values = values
+                    break
+        else:
+            value = _header_get(headers, "set-cookie")
+            if value:
+                set_cookie_values = [value]
+        for raw in set_cookie_values:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            name = raw.split("=", 1)[0].strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def detect_draft_mode(response: Any) -> bool:
+    """Check whether a response carries Next.js Draft Mode's cookies
+    (`__prerender_bypass` / `__next_preview_data`) -- if a scraping
+    session picks one of these up (a stray redirect through a preview
+    link, a shared cookie jar), Draft Mode bypasses the ISR cache and
+    every subsequent request on that session silently serves different
+    (preview/draft) content instead of the normal published page, with
+    no other visible signal that anything changed.
+
+    `response` accepts a `requests.Response`, a Scrapy `Response`, or a
+    plain `dict`/`set`/`list` of cookie names -- see
+    :func:`_extract_cookie_names`. See also `FlightSession`'s
+    `strip_draft_cookies` option, and `FlightMiddleware`'s
+    `NEXTFLIGHT_STRIP_DRAFT_COOKIES` setting, to actively remove these
+    instead of just detecting them."""
+    return bool(_extract_cookie_names(response) & set(_DRAFT_MODE_COOKIE_NAMES))
+
+
+_ERROR_DIGEST_RE = re.compile(r'"digest"\s*:\s*"([a-zA-Z0-9_-]+)"')
+
+
+def find_error_digest(html: Any) -> Optional[str]:
+    """Extract a Server Component error's `digest` correlation id from a
+    rendered error page, when present -- not scraping data, but useful
+    when *diagnosing* a scrape that came back empty: logging
+    `"parse failed, digest=abc123"` is far more actionable than just
+    "empty page" when reporting an issue against the target site or
+    searching your own crawl/server logs for the matching error. Returns
+    `None` if no digest is found, which is the common case for a page
+    that simply doesn't have Next.js data at all rather than one that
+    errored server-side."""
+    html = _coerce_html(html)
+    m = _ERROR_DIGEST_RE.search(html)
+    return m.group(1) if m else None
+
+
+_PAGINATION_KEY_SETS = (
+    {"hasNextPage", "endCursor"},
+    {"hasNextPage", "cursor"},
+    {"hasNextPage", "nextCursor"},
+    {"nextCursor"},
+    {"endCursor"},
+)
+
+
+def find_pagination_action(page: Any) -> Optional[dict]:
+    """Look for the common cursor-pagination shape (`hasNextPage`,
+    `cursor`/`endCursor`/`nextCursor` keys) anywhere in a page's Flight
+    data, via `find_by_keys` under the hood -- pre-packaged so each
+    project doesn't reinvent this detection per site. Many listing sites
+    paginate via a Server Action or an RSC fetch keyed off a cursor
+    rather than a plain `?page=2` URL, which `find_urls()` alone won't
+    catch since there's no URL string to find at all.
+
+    `page` accepts a `FlightExtractor` (or anything with a
+    `find_by_keys`/`find_any_keys` method), or raw HTML/a response-like
+    object, which is parsed with :func:`extract` first.
+
+    Returns the first matching dict found (checked in the order listed
+    above, most-specific shape first), or `None` if nothing matching any
+    of the known shapes is present."""
+    extractor = page if hasattr(page, "find_by_keys") else extract(page)
+    for key_set in _PAGINATION_KEY_SETS:
+        match = extractor.find_by_keys(key_set)
+        if match is not None:
+            return match
+    return None
 
 
 def detect_next_router(html: Any) -> str:
@@ -2286,6 +2636,15 @@ def detect_next_router(html: Any) -> str:
       :func:`find_next_data`.
     - ``"both"`` -- both patterns found (rare -- e.g. a Pages Router page
       embedding an App Router island, or a mid-migration site).
+    - ``"static_export"`` -- `output: 'export'` build. A Pages Router
+      export still has `__NEXT_DATA__` but flags it with a top-level
+      `"nextExport": true` field and no server-side data-fetching
+      methods; an App Router export has *no* Flight/`__NEXT_DATA__` at
+      all by design, so this falls back to a chunk-URL fingerprint
+      (`/_next/static/...` present in the HTML with neither of the other
+      two markers) to tell "static export" apart from "not Next.js at
+      all". Parsing "failure" against a `static_export` page isn't a
+      bug -- there's no server-rendered data payload to parse, ever.
     - ``"unknown"`` -- none of the above found. Could mean the page isn't
       server-rendered by Next.js at all, or uses a wire format version
       this library doesn't recognize yet.
@@ -2294,13 +2653,23 @@ def detect_next_router(html: Any) -> str:
     html = _coerce_html(html)
     has_flight = bool(FlightExtractor._PUSH_CALL_RE.search(html))
     has_raw_rsc = (not has_flight) and FlightExtractor._looks_like_raw_rsc_payload(html)
-    has_next_data = bool(_NEXT_DATA_RE.search(html))
+    next_data_match = _NEXT_DATA_RE.search(html)
+    has_next_data = bool(next_data_match)
     if (has_flight or has_raw_rsc) and has_next_data:
         return "both"
     if has_flight or has_raw_rsc:
         return "app"
     if has_next_data:
+        assert next_data_match is not None
+        try:
+            parsed = _json_loads(next_data_match.group(1))
+        except _JSON_ERRORS:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("nextExport") is True:
+            return "static_export"
         return "pages"
+    if _NEXT_CHUNK_SRC_RE.search(html):
+        return "static_export"
     return "unknown"
 
 
@@ -2712,10 +3081,20 @@ class FlightSession:
     dependency required. Pass `backend=` a `requests.Session` (or
     anything duck-typing its `.get()`/`.post()` interface) to use that
     instead, e.g. for connection pooling, retries, or proxy support
-    already configured on it."""
+    already configured on it.
+
+    `strip_draft_cookies=True` (the default) actively removes Next.js
+    Draft Mode's `__prerender_bypass`/`__next_preview_data` cookies from
+    the session after every `.get()` -- see :func:`detect_draft_mode`'s
+    docstring for why letting one of these linger on a scraping session
+    is dangerous (it silently makes every subsequent request bypass the
+    ISR cache and serve draft content instead of the published page).
+    Pass `False` if a workflow genuinely needs Draft Mode active on
+    purpose."""
 
     def __init__(self, *, backend: Any = None, headers: Optional[dict] = None,
-                 timeout: float = 15.0, strict: bool = False) -> None:
+                 timeout: float = 15.0, strict: bool = False,
+                 strip_draft_cookies: bool = True) -> None:
         self._backend = backend
         self._cookiejar = None
         self._opener = None
@@ -2731,6 +3110,7 @@ class FlightSession:
         }
         self.timeout = timeout
         self.strict = strict
+        self.strip_draft_cookies = strip_draft_cookies
         self._router_state_trees: dict = {}
 
     @staticmethod
@@ -2742,22 +3122,41 @@ class FlightSession:
             return None
         return {c.name: c.value for c in self._cookiejar}
 
+    def _strip_draft_cookies_from_jar(self) -> None:
+        if self._cookiejar is None or not self.strip_draft_cookies:
+            return
+        for cookie in list(self._cookiejar):
+            if cookie.name in _DRAFT_MODE_COOKIE_NAMES:
+                self._cookiejar.clear(cookie.domain, cookie.path, cookie.name)
+
     def get(self, url: str, *, headers: Optional[dict] = None) -> FlightExtractor:
         """GET `url`, parse it, and remember a best-effort router-state-
         tree hint for its route for a later `.call_action()`. Cookies set
         on the response are retained for subsequent calls on this
-        session, same as `requests.Session`."""
+        session, same as `requests.Session` -- except for Draft Mode's
+        cookies, which are stripped immediately afterward unless
+        `strip_draft_cookies=False` was passed to the constructor (see
+        class docstring)."""
         req_headers = dict(self.headers)
         if headers:
             req_headers.update(headers)
         if self._backend is not None:
             resp = self._backend.get(url, headers=req_headers, timeout=self.timeout)
             text = resp.text
+            if self.strip_draft_cookies:
+                jar = getattr(self._backend, "cookies", None)
+                if jar is not None:
+                    for name in _DRAFT_MODE_COOKIE_NAMES:
+                        try:
+                            del jar[name]
+                        except KeyError:
+                            pass
         else:
             assert self._opener is not None
             request = urllib.request.Request(url, headers=req_headers)
             with self._opener.open(request, timeout=self.timeout) as resp_obj:
                 text = _read_urllib_response_text(resp_obj)
+            self._strip_draft_cookies_from_jar()
         self._router_state_trees[self._route_key(url)] = capture_router_state_tree_hint(text)
         return FlightExtractor(text, strict=self.strict)
 

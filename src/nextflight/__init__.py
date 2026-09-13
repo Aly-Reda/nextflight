@@ -27,7 +27,10 @@ from .extractor import (
     find_page_props,
     find_server_action_ids,
     find_next_chunk_urls,
+    find_pagination_action,
+    find_error_digest,
     detect_next_router,
+    detect_base_path,
     diff_pages,
     call_server_action,
     capture_router_state_tree_hint,
@@ -36,6 +39,11 @@ from .extractor import (
     resolve_next_image_srcset,
     detect_challenge_page,
     detect_deployment_protection,
+    detect_middleware_rewrite,
+    detect_draft_mode,
+    get_cache_status,
+    get_rate_limit_headers,
+    get_edge_geo_headers,
 )
 from .postprocess import normalize_price, clean_text, parse_date
 
@@ -52,7 +60,10 @@ __all__ = [
     "find_page_props",
     "find_server_action_ids",
     "find_next_chunk_urls",
+    "find_pagination_action",
+    "find_error_digest",
     "detect_next_router",
+    "detect_base_path",
     "diff_pages",
     "call_server_action",
     "capture_router_state_tree_hint",
@@ -61,6 +72,11 @@ __all__ = [
     "resolve_next_image_srcset",
     "detect_challenge_page",
     "detect_deployment_protection",
+    "detect_middleware_rewrite",
+    "detect_draft_mode",
+    "get_cache_status",
+    "get_rate_limit_headers",
+    "get_edge_geo_headers",
     "normalize_price",
     "clean_text",
     "parse_date",
@@ -68,7 +84,7 @@ __all__ = [
     "extract_json_ld",      # deprecated alias, see below
 ]
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 
 # ---------------------------------------------------------------------- #

@@ -76,7 +76,7 @@ try:
 except ImportError:  # pragma: no cover - Scrapy < 2.5 lacks get_retry_request
     _RETRY_AVAILABLE = False
 
-from .extractor import FlightExtractor, detect_challenge_page
+from .extractor import FlightExtractor, detect_challenge_page, _DRAFT_MODE_COOKIE_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +159,17 @@ def _install_cached_extractor(response: Response, extractor: FlightExtractor) ->
             pass  # not weakly referenceable either -- nowhere safe to cache; give up silently
 
 
+def _is_draft_mode_cookie_header(raw_value: Any) -> bool:
+    """Whether a single raw `Set-Cookie` header value (bytes or str) is
+    setting one of Next.js Draft Mode's cookies -- used by
+    `FlightMiddleware`'s `NEXTFLIGHT_STRIP_DRAFT_COOKIES` to filter the
+    header list before Scrapy's own `CookiesMiddleware` ever sees it."""
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8", errors="replace")
+    name = raw_value.split("=", 1)[0].strip()
+    return name in _DRAFT_MODE_COOKIE_NAMES
+
+
 class FlightMiddleware:
     """Downloader middleware that installs a lazy `.flight` property on
     every `Response` object passed through it, so spiders never need to
@@ -182,6 +193,23 @@ class FlightMiddleware:
     `NextflightSpiderMixin` can default to it instead of every call site
     repeating `dedupe=True`.
 
+    A fourth setting, ``NEXTFLIGHT_STRIP_DRAFT_COOKIES`` (default
+    `True`), actively strips Next.js Draft Mode's
+    `__prerender_bypass`/`__next_preview_data` `Set-Cookie` headers
+    before they reach Scrapy's own `CookiesMiddleware` -- if one of these
+    lands in the crawl's cookie jar (a stray redirect through a preview
+    link, a shared jar), every subsequent request on that domain silently
+    bypasses the ISR cache and serves draft content instead of the
+    published page, with no other visible signal anything changed. This
+    requires `FlightMiddleware` to run its `process_response` *before*
+    `CookiesMiddleware` does -- i.e. have a *higher* priority number in
+    `DOWNLOADER_MIDDLEWARES` than `CookiesMiddleware`'s default of `700`
+    (Scrapy calls `process_response` in decreasing-priority order), which
+    the recommended `543` is not: set `FlightMiddleware` to `750` or
+    higher if this protection matters for a given crawl, or leave
+    `NEXTFLIGHT_STRIP_DRAFT_COOKIES = False` and check
+    `nextflight.detect_draft_mode(response)` manually instead.
+
     The property is (re)installed on every `FlightMiddleware()`
     construction -- not guarded behind `hasattr(Response, "flight")` --
     so that if settings differ between two middleware instances in the
@@ -189,10 +217,12 @@ class FlightMiddleware:
     wins, rather than silently keeping whichever settings happened to be
     used first."""
 
-    def __init__(self, strict: bool = False, repair: bool = False, dedupe_default: bool = False) -> None:
+    def __init__(self, strict: bool = False, repair: bool = False, dedupe_default: bool = False,
+                 strip_draft_cookies: bool = True) -> None:
         self.strict = strict
         self.repair = repair
         self.dedupe_default = dedupe_default
+        self.strip_draft_cookies = strip_draft_cookies
         # Per-domain cache for `next_version_hint()`: within one crawl,
         # every page of the same Next.js build has the same answer (the
         # wire-format markers it's fingerprinted against don't vary
@@ -213,6 +243,7 @@ class FlightMiddleware:
             strict=settings.getbool("NEXTFLIGHT_STRICT", False),
             repair=settings.getbool("NEXTFLIGHT_REPAIR", False),
             dedupe_default=settings.getbool("NEXTFLIGHT_DEDUPE", False),
+            strip_draft_cookies=settings.getbool("NEXTFLIGHT_STRIP_DRAFT_COOKIES", True),
         )
 
     def version_hint_for_response(self, response: Response) -> dict:
@@ -229,11 +260,18 @@ class FlightMiddleware:
 
     def process_response(self, request: Any, response: Response, spider: Any) -> Response:
         # The `.flight` property (installed in __init__, at the class
-        # level) already covers every response; nothing per-request
-        # needs to happen here. This hook exists so the middleware has
-        # somewhere valid to live in the downloader middleware chain and
-        # so Scrapy's normal enable/disable/ordering machinery applies to
-        # it like any other middleware.
+        # level) already covers every response; the only *active* work
+        # this hook does is the optional draft-cookie stripping below --
+        # see the class docstring for the priority-ordering caveat.
+        if self.strip_draft_cookies:
+            raw_values = response.headers.getlist(b"Set-Cookie")
+            if raw_values:
+                filtered = [v for v in raw_values if not _is_draft_mode_cookie_header(v)]
+                if len(filtered) != len(raw_values):
+                    if filtered:
+                        response.headers[b"Set-Cookie"] = filtered
+                    else:
+                        del response.headers[b"Set-Cookie"]
         return response
 
 

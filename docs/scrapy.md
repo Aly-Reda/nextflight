@@ -531,6 +531,26 @@ content" trap specific to Vercel: a preview (or protected production)
 deployment sitting behind Vercel's own login wall, easy to silently
 misread as "the page was just mostly empty."
 
+**A third look-alike: the ISR fallback skeleton (new in 0.4.3)** — a
+first request to a not-yet-generated `fallback: true`/`'blocking'` path
+also returns HTTP 200 with near-empty data, but for a completely
+different, non-adversarial reason: the page just hasn't finished
+generating yet. `parse_confidence()` scores this page as perfectly
+clean (every row *is* valid JSON), so it looks nothing like a challenge
+page or a truncation — it needs its own check,
+`FlightExtractor.is_fallback_skeleton()`, and its own reaction (wait and
+retry, not rotate a proxy):
+
+```python
+def parse(self, response):
+    if response.flight.is_fallback_skeleton():
+        self.logger.info(f"{response.url}: ISR still generating, retrying after a delay")
+        yield scrapy.Request(response.url, callback=self.parse, dont_filter=True,
+                              meta={"download_slot": response.url})  # or use a delayed-retry pattern
+        return
+    listing = response.flight.find_by_keys({"price", "title"})
+```
+
 ## Crawl-wide stats: parse confidence, version drift, early-stop counts
 
 For visibility into parse health across a whole crawl — not just
