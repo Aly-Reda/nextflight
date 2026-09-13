@@ -281,24 +281,6 @@ class ActionNotFoundError(FlightRequestError):
     different from what you'd do for, say, a timeout."""
 
 
-class FlightRequestError(Exception):
-    """Base class for errors raised while making a request on the
-    caller's behalf (currently: :func:`call_server_action`). Distinct
-    from :class:`FlightParseError`, which is about a row's *content*
-    being malformed, not the HTTP exchange that fetched it."""
-
-
-class ActionNotFoundError(FlightRequestError):
-    """Raised by :func:`call_server_action` when the server reports it
-    can no longer find the requested Server Action id -- almost always
-    because a redeploy regenerated action ids since this one was
-    scraped from an earlier page load. Without this, the failure
-    surfaces as an opaque 500 (or a 200 rendering a generic error
-    component) that looks identical to any other request-gone-wrong,
-    even though the fix (re-discover the id with
-    :func:`find_server_action_ids` against a fresh page) is completely
-    different from what you'd do for, say, a timeout."""
-
 
 class _LazyRawChunks(Mapping):
     """Dict-like view over a page's chunks that decodes each chunk's raw
@@ -2772,6 +2754,7 @@ class FlightSession:
             resp = self._backend.get(url, headers=req_headers, timeout=self.timeout)
             text = resp.text
         else:
+            assert self._opener is not None
             request = urllib.request.Request(url, headers=req_headers)
             with self._opener.open(request, timeout=self.timeout) as resp_obj:
                 text = _read_urllib_response_text(resp_obj)
