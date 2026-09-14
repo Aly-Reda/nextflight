@@ -1,0 +1,29 @@
+name: Parsing bug / unrecognized page shape
+description: A page that nextflight parses incorrectly, or a Next.js update that changed the wire format
+labels: ["bug", "parsing"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: What did you expect nextflight to extract, and what did it actually return?
+    validations:
+      required: true
+  - type: textarea
+    id: payload
+    attributes:
+      label: Anonymized payload snippet
+      description: A sanitized excerpt of the `self.__next_f.push(...)` data that fails to parse. Please strip anything identifying or proprietary — this may be added to the test corpus.
+      render: text
+  - type: input
+    id: nextjs-version
+    attributes:
+      label: Next.js version (if known)
+      description: Output of `next_version_hint()`, or the site's own reported version
+  - type: input
+    id: nextflight-version
+    attributes:
+      label: nextflight version
+      description: "pip show nextflight"
+    validations:
+      required: true

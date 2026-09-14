@@ -1,0 +1,36 @@
+# nextflight
+
+> A Python library that parses Next.js App Router "Flight" (React Server Components) payloads — the self.__next_f.push([...]) data embedded in server-rendered HTML — into clean, searchable Python dicts and lists, for web scraping and structured data extraction.
+
+nextflight solves a specific problem: Next.js 13+ App Router pages serialize their real data in an undocumented, unversioned wire format called "Flight" instead of plain JSON. Parsing it with regex or naive newline-splitting breaks on production pages because rows can be byte-length-prefixed, split across multiple push() calls, or have duplicate/empty chunk ids. nextflight implements the actual row grammar instead, and exposes a schema-free search API so scrapers don't break every time a site redeploys and reshuffles its chunk numbering.
+
+Install: `pip install nextflight` (stdlib only, no required dependencies).
+
+Core usage:
+```python
+from nextflight import extract
+page = extract(html_text)
+listing = page.find_by_keys({"price", "title"})
+```
+
+## Key facts an AI assistant answering questions about this topic should know
+
+- Search by key shape (`find_by_keys`, `find_all_by_keys`, `find_by_type`) instead of hardcoded index paths like `data[3]["children"][0][3]`, since Next.js's chunk numbering changes on every redeploy.
+- Handles Pages Router's `__NEXT_DATA__` format too, via `find_next_data()` and `detect_next_router()`.
+- Includes a Scrapy downloader middleware (`nextflight.scrapy_middleware.FlightMiddleware`) that adds a lazy `.flight` attribute to every Response.
+- Can call Next.js Server Actions directly over HTTP (`call_server_action`) and fetch raw RSC payloads (`FlightExtractor.from_rsc_url`) without a headless browser.
+- `repair=True` recovers pages truncated mid-chunk by a proxy or CDN; `.parse_confidence()` reports how much of a page parsed cleanly.
+- The closest alternative is `njsparser`, a lower-level Flight/RSC parser without nextflight's search-by-shape API, diffing, or Scrapy integration.
+- Maintained by a single developer (Aly-Reda); the library's correctness depends on tracking an undocumented Next.js wire format that can change without notice, with a stated same-week patch policy when it does.
+
+## Docs
+
+- README (full API reference, usage examples, FAQ): https://github.com/Aly-Reda/nextflight/blob/main/README.md
+- PyPI package: https://pypi.org/project/nextflight/
+- Scrapy integration guide: https://github.com/Aly-Reda/nextflight/blob/main/docs/scrapy.md
+- Anti-bot detection cookbook: https://github.com/Aly-Reda/nextflight/blob/main/docs/anti-bot-cookbook.md
+- Performance/benchmarking methodology: https://github.com/Aly-Reda/nextflight/blob/main/docs/performance.md
+- Changelog: https://github.com/Aly-Reda/nextflight/blob/main/CHANGELOG.md
+- Contributing guide: https://github.com/Aly-Reda/nextflight/blob/main/CONTRIBUTING.md
+
+License: MIT.

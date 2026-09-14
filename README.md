@@ -1,12 +1,14 @@
 # nextflight
 
+**A Python library to scrape and parse Next.js (App Router) pages — decode React Server Components ("Flight") payloads and `self.__next_f.push()` data into clean, searchable JSON.**
+
 [![PyPI version](https://img.shields.io/pypi/v/nextflight.svg)](https://pypi.org/project/nextflight/)
+[![Downloads](https://img.shields.io/pypi/dm/nextflight.svg)](https://pypi.org/project/nextflight/)
 [![Python versions](https://img.shields.io/pypi/pyversions/nextflight.svg)](https://pypi.org/project/nextflight/)
 [![CI](https://github.com/Aly-Reda/nextflight/actions/workflows/ci.yml/badge.svg)](https://github.com/Aly-Reda/nextflight/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Typed](https://img.shields.io/badge/typing-typed-brightgreen.svg)](https://peps.python.org/pep-0561/)
-
-**A Python library to scrape and parse Next.js (App Router) pages — decode React Server Components ("Flight") payloads and `self.__next_f.push()` data into clean, searchable JSON.**
+[![GitHub stars](https://img.shields.io/github/stars/Aly-Reda/nextflight?style=social)](https://github.com/Aly-Reda/nextflight/stargazers)
 
 `nextflight` parses the React Server Components ("Flight") payloads that
 Next.js embeds in server-rendered HTML — the
@@ -30,6 +32,8 @@ If you've ever searched for *"how to scrape a Next.js site"*, *"parse
 self.__next_f.push in Python"*, or *"extract JSON from Next.js
 __NEXT_DATA__ / Flight payload"* — this is that tool.
 
+> If nextflight saves you from writing another regex against `push()` calls, a star helps other people searching for this problem find it too.
+
 ## Contents
 
 - [Install](#install)
@@ -44,6 +48,7 @@ __NEXT_DATA__ / Flight payload"* — this is that tool.
 - [A note on maintenance](#a-note-on-maintenance)
 - [Roadmap and design proposals](#roadmap-and-design-proposals)
 - [License](#license)
+- [Contributing](#contributing)
 
 ## Install
 
@@ -809,6 +814,14 @@ the direction is visible rather than only living in an issue tracker:
   execution) directly from a live browser session.
 - Anonymized-payload GitHub issue template, with accepted submissions
   wired into the regression test corpus.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Aly-Reda/nextflight&type=Date)](https://star-history.com/#Aly-Reda/nextflight&Date)
+
+## Contributing
+
+Bug reports (especially anonymized payloads from pages that parse incorrectly), documentation fixes, and PRs are all welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions and what’s most useful to contribute.
 
 ## License
 

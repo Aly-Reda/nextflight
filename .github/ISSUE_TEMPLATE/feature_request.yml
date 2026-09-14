@@ -1,0 +1,15 @@
+name: Feature request
+description: Suggest a new capability or API
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What are you trying to do?
+      description: The real scraping/extraction task this would help with
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API or behavior
