@@ -1,0 +1,13 @@
+<svg width="200" height="200" viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>nextflight logo icon</title>
+<desc>Simple circular badge with a white N whose top diagonal tapers into a single paper airplane wing in a blue to yellow gradient</desc>
+<defs>
+<linearGradient id="wing" x1="0" y1="0" x2="1" y2="0.4">
+<stop offset="0%" stop-color="#FFD43B"/>
+<stop offset="100%" stop-color="#306998"/>
+</linearGradient>
+</defs>
+<circle cx="200" cy="200" r="170" fill="#11151C"/>
+<path d="M148 280 L148 120 L168 120 L232 220 L232 120 L252 120 L252 280 L232 280 L168 180 L168 280 Z" fill="#FFFFFF"/>
+<path d="M232 150 L300 116 L236 190 Z" fill="url(#wing)"/>
+</svg>

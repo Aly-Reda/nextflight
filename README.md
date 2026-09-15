@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-icon.svg" alt="nextflight logo" width="120" />
+</p>
+
 # nextflight
 
 **A Python library to scrape and parse Next.js (App Router) pages — decode React Server Components ("Flight") payloads and `self.__next_f.push()` data into clean, searchable JSON.**
