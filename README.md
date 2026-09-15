@@ -1,12 +1,10 @@
 <p align="center">
-  <img src="assets/logo-banner.svg" alt="nextflight logo" width="180" />
+  <img src="assets/logo-banner.svg" alt="nextflight logo" width="96" align="left" />
+  <h1>nextflight</h1>
+  <p><strong>A Python library to scrape and parse Next.js (App Router) pages — decode React Server Components ("Flight") payloads and <code>self.__next_f.push()</code> data into clean, searchable JSON.</strong></p>
 </p>
 
-<h1 align="center">nextflight</h1>
-
-<p align="center">
-  <strong>A Python library to scrape and parse Next.js (App Router) pages — decode React Server Components ("Flight") payloads and <code>self.__next_f.push()</code> data into clean, searchable JSON.</strong>
-</p>
+<br clear="left"/>
 
 <p align="center">
 
