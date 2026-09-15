@@ -1,10 +1,14 @@
 <p align="center">
-  <img src="assets/logo-icon.svg" alt="nextflight logo" width="120" />
+  <img src="assets/logo-banner.svg" alt="nextflight logo" width="180" />
 </p>
 
-# nextflight
+<h1 align="center">nextflight</h1>
 
-**A Python library to scrape and parse Next.js (App Router) pages — decode React Server Components ("Flight") payloads and `self.__next_f.push()` data into clean, searchable JSON.**
+<p align="center">
+  <strong>A Python library to scrape and parse Next.js (App Router) pages — decode React Server Components ("Flight") payloads and <code>self.__next_f.push()</code> data into clean, searchable JSON.</strong>
+</p>
+
+<p align="center">
 
 [![PyPI version](https://img.shields.io/pypi/v/nextflight.svg)](https://pypi.org/project/nextflight/)
 [![Downloads](https://img.shields.io/pypi/dm/nextflight.svg)](https://pypi.org/project/nextflight/)
@@ -13,6 +17,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Typed](https://img.shields.io/badge/typing-typed-brightgreen.svg)](https://peps.python.org/pep-0561/)
 [![GitHub stars](https://img.shields.io/github/stars/Aly-Reda/nextflight?style=social)](https://github.com/Aly-Reda/nextflight/stargazers)
+
+</p>
 
 `nextflight` parses the React Server Components ("Flight") payloads that
 Next.js embeds in server-rendered HTML — the
