@@ -1,7 +1,7 @@
 <table>
 <tr>
-<td width="110">
-  <img src="assets/logo-banner.svg" alt="nextflight logo" width="96" />
+<td width="170">
+  <img src="assets/logo-banner.svg" alt="nextflight logo" width="150" />
 </td>
 <td>
 
